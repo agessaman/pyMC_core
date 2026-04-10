@@ -12,6 +12,7 @@ Frame format:
 """
 
 import asyncio
+import contextvars
 import logging
 import socket
 import struct
@@ -127,6 +128,10 @@ from .models import Contact, QueuedMessage
 
 logger = logging.getLogger("CompanionFrameServer")
 
+_session_context: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "companion_frame_session_id", default=None
+)
+
 
 def _build_advert_push_frames(contact: Contact) -> tuple[bytes, Optional[bytes]]:
     """Build PUSH_CODE_ADVERT short frame and optional PUSH_CODE_NEW_ADVERT
@@ -203,6 +208,9 @@ class CompanionFrameServer:
         self._client_reader: Optional[asyncio.StreamReader] = None
         self._write_queue: Optional[asyncio.Queue] = None
         self._writer_task: Optional[asyncio.Task] = None
+        self._active_session_id: Optional[int] = None
+        self._session_counter = 0
+        self._stopping = False
         self._app_target_ver = 0
 
         # Pre-compute padded device info bytes for _cmd_device_query. Version string
@@ -293,20 +301,28 @@ class CompanionFrameServer:
 
     async def stop(self) -> None:
         """Stop the TCP server and disconnect any client."""
+        self._stopping = True
+        local_queue = self._write_queue
+        local_writer_task = self._writer_task
+        self._write_queue = None
+        self._writer_task = None
+        self._active_session_id = None
+
         # Signal writer task to stop and wait for it
-        if self._write_queue is not None:
+        if local_queue is not None:
             try:
-                self._write_queue.put_nowait(None)  # Sentinel
+                local_queue.put_nowait(None)  # Sentinel
             except asyncio.QueueFull:
-                pass
-        if self._writer_task is not None:
-            self._writer_task.cancel()
+                logger.debug(
+                    "Write queue full during stop (port=%s); skipping sentinel",
+                    self.port,
+                )
+        if local_writer_task is not None:
+            local_writer_task.cancel()
             try:
-                await self._writer_task
+                await local_writer_task
             except asyncio.CancelledError:
                 pass
-            self._writer_task = None
-        self._write_queue = None
         if self._client_writer:
             try:
                 self._client_writer.close()
@@ -355,7 +371,7 @@ class CompanionFrameServer:
     # Push callbacks
     # -------------------------------------------------------------------------
 
-    def _setup_push_callbacks(self) -> None:
+    def _setup_push_callbacks(self, session_id: int) -> None:
         """Subscribe to bridge events and send PUSH frames to connected client."""
         # Clear any callbacks registered by a previous connection so they
         # don't accumulate across reconnections.
@@ -363,7 +379,7 @@ class CompanionFrameServer:
 
         def _write_push(data: bytes) -> None:
             """Enqueue a push frame. Sync, non-blocking."""
-            self._enqueue_frame(data)
+            self._enqueue_frame(data, session_id=session_id)
 
         async def on_message_received(
             sender_key, text, timestamp, txt_type, packet_hash=None, snr=None, rssi=None
@@ -643,13 +659,27 @@ class CompanionFrameServer:
         self._enqueue_frame(data)
         logger.debug("Pushed control data 0x8E to client: payload_len=%s", len(payload_slice))
 
-    def _enqueue_frame(self, data: bytes) -> None:
+    def _enqueue_frame(self, data: bytes, *, session_id: Optional[int] = None) -> None:
         """Build an outbound frame and enqueue it for the writer task.
 
         Sync, non-blocking.  On ``QueueFull`` the frame is dropped with a
         warning — this provides natural backpressure shedding.
         """
-        if self._write_queue is None:
+        if self._stopping:
+            logger.debug("Dropping outbound frame while stopping (port=%s)", self.port)
+            return
+        if session_id is None:
+            session_id = _session_context.get()
+        if session_id is not None and session_id != self._active_session_id:
+            logger.debug(
+                "Dropping stale-session frame (port=%s, frame_session=%s, active_session=%s)",
+                self.port,
+                session_id,
+                self._active_session_id,
+            )
+            return
+        write_queue = self._write_queue
+        if write_queue is None:
             return
         if len(data) > MAX_PAYLOAD_SIZE:
             logger.warning(
@@ -661,9 +691,9 @@ class CompanionFrameServer:
             data = data[:MAX_PAYLOAD_SIZE]
         frame = bytes([FRAME_OUTBOUND_PREFIX]) + struct.pack("<H", len(data)) + data
         try:
-            self._write_queue.put_nowait(frame)
+            write_queue.put_nowait(frame)
         except asyncio.QueueFull:
-            logger.warning("Write queue full (%s); dropping frame", self._write_queue.maxsize)
+            logger.warning("Write queue full (%s); dropping frame", write_queue.maxsize)
 
     def _write_frame(self, data: bytes) -> None:
         """Alias for ``_enqueue_frame``; retained for subclass compatibility."""
@@ -686,7 +716,7 @@ class CompanionFrameServer:
     # (e.g. _receive_count per data_received()) stay in sync with sends.
     _DRAIN_BATCH = 1
 
-    async def _writer_loop(self, writer: asyncio.StreamWriter) -> None:
+    async def _writer_loop(self, writer: asyncio.StreamWriter, write_queue: asyncio.Queue) -> None:
         """Single writer task: pull frames from the queue, write to the
         ``StreamWriter``, and drain periodically.
 
@@ -704,7 +734,7 @@ class CompanionFrameServer:
                 # Wait for a frame, or timeout for heartbeat ---------
                 try:
                     frame = await asyncio.wait_for(
-                        self._write_queue.get(),
+                        write_queue.get(),
                         timeout=self._heartbeat_interval,
                     )
                 except asyncio.TimeoutError:
@@ -723,7 +753,7 @@ class CompanionFrameServer:
                 frames_since_drain += 1
 
                 # Drain when queue empties (natural batching) or every N frames
-                if self._write_queue.empty() or frames_since_drain >= self._DRAIN_BATCH:
+                if write_queue.empty() or frames_since_drain >= self._DRAIN_BATCH:
                     await writer.drain()
                     frames_since_drain = 0
         except asyncio.CancelledError:
@@ -787,6 +817,7 @@ class CompanionFrameServer:
                 self.port,
             )
             old_writer = self._client_writer
+            old_write_queue = self._write_queue
             old_writer_task = self._writer_task
             # Cancel and await the old writer task so it's fully gone before we replace
             # the queue and create a new task (avoids the new task being mistaken for
@@ -799,21 +830,27 @@ class CompanionFrameServer:
                     pass
                 if self._writer_task is old_writer_task:
                     self._writer_task = None
+            if self._write_queue is old_write_queue:
+                self._write_queue = None
             try:
                 old_writer.close()
                 await old_writer.wait_closed()
             except Exception:
                 pass
 
+        self._stopping = False
+        self._session_counter += 1
+        local_session_id = self._session_counter
+        self._active_session_id = local_session_id
         self._client_reader = reader
         self._client_writer = writer
         self._configure_socket(writer)
         local_write_queue: asyncio.Queue = asyncio.Queue(maxsize=self._WRITE_QUEUE_MAXSIZE)
         self._write_queue = local_write_queue
-        self._setup_push_callbacks()
+        self._setup_push_callbacks(local_session_id)
         logger.info("Companion client connected (port=%s)", self.port)
 
-        local_writer_task = asyncio.create_task(self._writer_loop(writer))
+        local_writer_task = asyncio.create_task(self._writer_loop(writer, local_write_queue))
         self._writer_task = local_writer_task
         disconnect_reason: Optional[str] = None
         try:
@@ -838,7 +875,11 @@ class CompanionFrameServer:
                     disconnect_reason = "frame_too_long"
                     break
                 payload = await reader.readexactly(frame_len)
-                await self._handle_cmd(payload)
+                token = _session_context.set(local_session_id)
+                try:
+                    await self._handle_cmd(payload)
+                finally:
+                    _session_context.reset(token)
                 if local_writer_task.done():
                     disconnect_reason = "writer_failed"
                     if not local_writer_task.cancelled():
@@ -886,6 +927,8 @@ class CompanionFrameServer:
             if self._client_writer is writer:
                 self._client_writer = None
                 self._client_reader = None
+                if self._active_session_id == local_session_id:
+                    self._active_session_id = None
                 logger.info(
                     "Companion client disconnected (port=%s): %s",
                     self.port,

@@ -364,7 +364,7 @@ async def test_writer_loop_writes_and_drains():
 
     asyncio.create_task(_send_sentinel())
 
-    await server._writer_loop(writer)
+    await server._writer_loop(writer, server._write_queue)
 
     writer.write.assert_called_once()
     writer.drain.assert_awaited_once()
@@ -619,6 +619,52 @@ class _DummyWriter:
         return self.closed
 
 
+class _CallbackBridge:
+    """Minimal bridge that stores callbacks and allows manual emits."""
+
+    def __init__(self):
+        self._callbacks = {}
+        self.contacts = Mock()
+        self.contacts.get_by_key = Mock(return_value=True)
+
+    def clear_push_callbacks(self):
+        self._callbacks.clear()
+
+    def on_message_received(self, cb):
+        self._callbacks["on_message_received"] = cb
+
+    def on_channel_message_received(self, cb):
+        self._callbacks["on_channel_message_received"] = cb
+
+    def on_send_confirmed(self, cb):
+        self._callbacks["on_send_confirmed"] = cb
+
+    def on_advert_received(self, cb):
+        self._callbacks["on_advert_received"] = cb
+
+    def on_contact_path_updated(self, cb):
+        self._callbacks["on_contact_path_updated"] = cb
+
+    def on_binary_response(self, cb):
+        self._callbacks["on_binary_response"] = cb
+
+    def on_path_discovery_response(self, cb):
+        self._callbacks["on_path_discovery_response"] = cb
+
+    def on_contact_deleted(self, cb):
+        self._callbacks["on_contact_deleted"] = cb
+
+    def on_contacts_full(self, cb):
+        self._callbacks["on_contacts_full"] = cb
+
+    def on_raw_data_received(self, cb):
+        self._callbacks["on_raw_data_received"] = cb
+
+    async def emit_message_received(self):
+        cb = self._callbacks["on_message_received"]
+        await cb(b"\x00" * 32, "hello", 1, 0)
+
+
 @pytest.mark.asyncio
 async def test_evicted_handler_cleanup_does_not_cancel_new_writer_task():
     """Old handler finally block must not tear down new client writer state."""
@@ -693,3 +739,53 @@ async def test_handle_client_connection_reset_disconnects_cleanly(caplog):
     assert server._client_reader is None
     assert server._writer_task is None
     assert any("ConnectionResetError" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_stale_session_callback_push_is_dropped_after_session_switch():
+    """Async callback resumed after eviction must not enqueue to new session."""
+    bridge = _CallbackBridge()
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    block = asyncio.Event()
+
+    async def _persist_blocking(_msg_dict):
+        await block.wait()
+
+    server._persist_companion_message = _persist_blocking
+
+    queue1 = asyncio.Queue(maxsize=10)
+    queue2 = asyncio.Queue(maxsize=10)
+
+    server._active_session_id = 1
+    server._write_queue = queue1
+    server._setup_push_callbacks(1)
+
+    task = asyncio.create_task(bridge.emit_message_received())
+    await asyncio.sleep(0)  # callback enters await persist
+
+    server._active_session_id = 2
+    server._write_queue = queue2
+    block.set()
+    await task
+
+    assert queue1.empty()
+    assert queue2.empty()
+
+
+@pytest.mark.asyncio
+async def test_stop_gates_producers_and_prevents_new_enqueues():
+    """stop() should prevent frames from being enqueued after shutdown starts."""
+    bridge = Mock()
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    queue = asyncio.Queue(maxsize=10)
+    server._write_queue = queue
+    server._writer_task = asyncio.create_task(asyncio.sleep(3600))
+
+    await server.stop()
+    before = queue.qsize()
+    server._enqueue_frame(bytes([0x01]))
+    after = queue.qsize()
+
+    assert before == after
+    assert server._write_queue is None
+    assert server._writer_task is None
