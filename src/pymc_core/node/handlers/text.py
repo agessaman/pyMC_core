@@ -31,6 +31,15 @@ class TextMessageHandler(BaseHandler):
         """Set callback function for command responses."""
         self.command_response_callback = callback
 
+    def _signed_plain_ack_truncated_hash(self, decrypted: bytes) -> bytes:
+        """MeshCore BaseChatMesh: sha256(data, 9 + strlen(&data[9]), self_id.pub_key)[:4]."""
+        tail = decrypted[9:]
+        first_nul = tail.find(b"\x00")
+        signed_text = tail if first_nul < 0 else tail[:first_nul]
+        hash_len = 9 + len(signed_text)
+        ack_payload = decrypted[:hash_len] + self.local_identity.get_public_key()
+        return CryptoUtils.sha256(ack_payload)[:4]
+
     def _contact_pubkey_bytes(self, contact) -> bytes:
         """Return contact's public key as 32 bytes (handles hex str or bytes)."""
         pk = contact.public_key
@@ -106,23 +115,28 @@ class TextMessageHandler(BaseHandler):
             f"timestamp: {timestamp_int}, txt_type: {txt_type}"
         )
 
-        # Skip ACK for TXT_TYPE_CLI_DATA (0x01) - CLI commands don't need ACKs
-        # Following C++ pattern: only TXT_TYPE_PLAIN (0x00) gets ACKs
+        # Skip ACK for TXT_TYPE_CLI_DATA (0x01) - CLI commands don't need ACKs.
+        # BaseChatMesh: PLAIN and SIGNED_PLAIN get delivery ACK; CLI_DATA does not.
         TXT_TYPE_PLAIN = 0x00
-        TXT_TYPE_CLI_DATA = 0x01  # noqa: F841
-        send_ack = txt_type == TXT_TYPE_PLAIN
+        TXT_TYPE_SIGNED_PLAIN = 0x02
+        send_ack = txt_type in (TXT_TYPE_PLAIN, TXT_TYPE_SIGNED_PLAIN)
+        signed_ack_too_short = txt_type == TXT_TYPE_SIGNED_PLAIN and len(decrypted) < 9
+        if signed_ack_too_short:
+            self.log("SIGNED_PLAIN payload too short for ACK hash; skipping ACK only")
 
-        if send_ack:
+        if send_ack and not signed_ack_too_short:
             # Create appropriate ACK response
             if is_flood:
-                # FLOOD messages use PATH ACK responses with ACK hash in extra payload
-                text_bytes = message_body.rstrip(b"\x00")
+                if txt_type == TXT_TYPE_SIGNED_PLAIN:
+                    ack_hash = self._signed_plain_ack_truncated_hash(decrypted)
+                else:
+                    # FLOOD messages use PATH ACK responses with ACK hash in extra payload
+                    text_bytes = message_body.rstrip(b"\x00")
+                    pack_data = PacketBuilder._pack_timestamp_data(
+                        timestamp_int, attempt, text_bytes
+                    )
+                    ack_hash = CryptoUtils.sha256(pack_data + pubkey)[:4]
 
-                # Calculate ACK hash using standard method (same as DIRECT messages)
-                pack_data = PacketBuilder._pack_timestamp_data(timestamp_int, attempt, text_bytes)
-                ack_hash = CryptoUtils.sha256(pack_data + pubkey)[:4]
-
-                # Create PATH ACK response
                 incoming_path = list(packet.path if hasattr(packet, "path") else [])
                 path_len_encoded = (
                     getattr(packet, "path_len", None)
@@ -152,12 +166,16 @@ class TextMessageHandler(BaseHandler):
 
             else:
                 # DIRECT messages use discrete ACK packets
-                ack_packet = PacketBuilder.create_ack(
-                    pubkey=pubkey,
-                    timestamp=timestamp_int,
-                    attempt=attempt,
-                    text=message_body.rstrip(b"\x00"),
-                )
+                if txt_type == TXT_TYPE_SIGNED_PLAIN:
+                    ack_hash = self._signed_plain_ack_truncated_hash(decrypted)
+                    ack_packet = PacketBuilder.create_ack_from_truncated_hash(ack_hash)
+                else:
+                    ack_packet = PacketBuilder.create_ack(
+                        pubkey=pubkey,
+                        timestamp=timestamp_int,
+                        attempt=attempt,
+                        text=message_body.rstrip(b"\x00"),
+                    )
 
                 packet_len = len(ack_packet.write_to())
                 ack_airtime = PacketTimingUtils.estimate_airtime_ms(packet_len, self.radio_config)
@@ -183,7 +201,7 @@ class TextMessageHandler(BaseHandler):
             # Schedule ACK to be sent after delay (non-blocking)
             asyncio.create_task(send_delayed_ack())
         else:
-            self.log(f"Skipping ACK for txt_type={txt_type} (CLI command)")
+            self.log(f"Skipping ACK for txt_type={txt_type} (CLI or unsupported)")
 
         decoded_msg = message_body.decode("utf-8", "replace")
         self.log(f"Received TXT_MSG: {decoded_msg}")

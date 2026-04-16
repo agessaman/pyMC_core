@@ -230,6 +230,19 @@ class PacketBuilder:
         return PacketBuilder._create_packet(header, digest[:4])
 
     @staticmethod
+    def create_ack_from_truncated_hash(truncated_hash: bytes) -> Packet:
+        """
+        Build a PAYLOAD_TYPE_ACK packet carrying a precomputed 4-byte truncated SHA256.
+
+        Used when the hash input layout differs from :meth:`create_ack` (e.g.
+        ``TXT_TYPE_SIGNED_PLAIN`` uses local identity + different byte range).
+        """
+        if not isinstance(truncated_hash, bytes) or len(truncated_hash) != 4:
+            raise ValueError("truncated_hash must be exactly 4 bytes")
+        header = PacketBuilder._create_header(PAYLOAD_TYPE_ACK)
+        return PacketBuilder._create_packet(header, truncated_hash)
+
+    @staticmethod
     def create_self_advert(
         local_identity: Any,
         name: str,

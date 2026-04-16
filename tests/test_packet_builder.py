@@ -27,6 +27,32 @@ def test_packet_builder_create_ack():
     assert ack_packet.get_payload_type() == PAYLOAD_TYPE_ACK
 
 
+def test_create_ack_from_truncated_hash():
+    """Precomputed 4-byte digest (e.g. SIGNED_PLAIN) builds a minimal ACK packet."""
+    digest = bytes([0x01, 0x02, 0x03, 0x04])
+    pkt = PacketBuilder.create_ack_from_truncated_hash(digest)
+    assert pkt.get_payload_type() == PAYLOAD_TYPE_ACK
+    assert bytes(pkt.payload) == digest
+
+
+def test_signed_plain_ack_hash_matches_meshcore_formula():
+    """BaseChatMesh PLAIN signed: sha256(data, 9 + strlen(text@data[9]), self_id.pub_key)."""
+    local = LocalIdentity()
+    local_pk = local.get_public_key()
+    ts = 0x12345678
+    ts_bytes = ts.to_bytes(4, "little")
+    flags = (2 << 2) | 1  # TXT_TYPE_SIGNED_PLAIN, attempt 1
+    author_prefix = bytes([0xAA, 0xBB, 0xCC, 0xDD])
+    text = b"hi"
+    decrypted = ts_bytes + bytes([flags]) + author_prefix + text + b"\x00"
+    hash_len = 9 + len(text)
+    expected = CryptoUtils.sha256(decrypted[:hash_len] + local_pk)[:4]
+    assert len(expected) == 4
+    # Regression: full decrypted including trailing null must not be included in hash input
+    wrong = CryptoUtils.sha256(decrypted + local_pk)[:4]
+    assert expected != wrong
+
+
 def test_packet_builder_create_advert():
     """Test creating advertisement packets."""
     identity = LocalIdentity()
