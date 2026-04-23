@@ -97,7 +97,8 @@ MAX_PENDING_ACK_CRCS = 64
 # Protocol version reported in RESP_CODE_DEVICE_INFO; phone uses 9+ to infer
 # CMD_SEND_ANON_REQ (owner requests, etc.) is supported.
 # 10+ provides support for multi-byte path lengths.
-FIRMWARE_VER_CODE = 10
+# 11+ adds channel binary datagrams and default flood scope commands.
+FIRMWARE_VER_CODE = 11
 
 # ---------------------------------------------------------------------------
 # Commands (app -> radio)
@@ -155,6 +156,9 @@ CMD_SEND_ANON_REQ = 57
 CMD_SET_AUTOADD_CONFIG = 58
 CMD_GET_AUTOADD_CONFIG = 59
 CMD_SET_PATH_HASH_MODE = 61
+CMD_SEND_CHANNEL_DATA = 62
+CMD_SET_DEFAULT_FLOOD_SCOPE = 63
+CMD_GET_DEFAULT_FLOOD_SCOPE = 64
 
 # ---------------------------------------------------------------------------
 # Response codes (radio -> app)
@@ -185,6 +189,8 @@ RESP_CODE_ADVERT_PATH = 22
 RESP_CODE_TUNING_PARAMS = 23
 RESP_CODE_STATS = 24
 RESP_CODE_AUTOADD_CONFIG = 25
+RESP_CODE_CHANNEL_DATA_RECV = 27
+RESP_CODE_DEFAULT_FLOOD_SCOPE = 28
 
 # ---------------------------------------------------------------------------
 # Push codes (radio -> app, unsolicited)
@@ -226,6 +232,9 @@ FRAME_INBOUND_PREFIX = 0x3C  # '<'
 # is set to this (e.g. BLEDevice::setMTU(MAX_FRAME_SIZE)). Frame = prefix(1) + len(2) + payload.
 MAX_FRAME_SIZE = 172
 MAX_PAYLOAD_SIZE = MAX_FRAME_SIZE - 3  # max bytes after prefix + 2-byte length
+# Firmware companion command parser uses MAX_FRAME_SIZE - 9 for channel binary payloads.
+MAX_CHANNEL_DATA_LENGTH = MAX_FRAME_SIZE - 9
+OUT_PATH_UNKNOWN = 0xFF
 PUB_KEY_SIZE = 32
 MAX_PATH_SIZE = 64
 

@@ -345,9 +345,26 @@ companion.set_flood_scope(key)
 companion.set_flood_region(None)
 ```
 
+For MeshCore v1.15 parity, the frame protocol also supports a persisted default flood scope:
+
+- `CMD_SET_DEFAULT_FLOOD_SCOPE` (`63`) stores `name(31)` + `key(16)`
+- `CMD_GET_DEFAULT_FLOOD_SCOPE` (`64`) returns the stored value (or empty if unset)
+
+pyMC_core resolves effective flood scope as:
+
+1. transient key set by `CMD_SET_FLOOD_SCOPE` / `set_flood_scope()`
+2. otherwise persisted default key (if configured)
+3. otherwise unscoped flood
+
 When a flood scope is active, all flood packets are tagged with a 16-bit transport code
 (HMAC-SHA256 derived) and sent as `ROUTE_TYPE_TRANSPORT_FLOOD`. Direct-routed packets
 are unaffected.
+
+### Firmware v1.15 Note (nRF BLE DFU)
+
+MeshCore v1.15 may expose Nordic DFU service on the normal nRF companion BLE stack.
+This does not change pyMC_core TCP frame protocol behavior, but BLE clients should not
+assume only UART service is present on companion devices.
 
 ### Cryptographic Signing
 
@@ -613,6 +630,17 @@ The frame server handles the following companion radio protocol commands:
 | `CMD_GET_STATS` | 56 | Get statistics |
 | `CMD_SET_AUTOADD_CONFIG` | 58 | Set auto-add configuration |
 | `CMD_GET_AUTOADD_CONFIG` | 59 | Get auto-add configuration |
+| `CMD_SEND_CHANNEL_DATA` | 62 | Send binary channel datagram (`data_type + payload`) |
+| `CMD_SET_DEFAULT_FLOOD_SCOPE` | 63 | Persist default flood scope (`name(31) + key(16)`) |
+| `CMD_GET_DEFAULT_FLOOD_SCOPE` | 64 | Get persisted default flood scope |
+
+`CMD_SEND_CHANNEL_DATA` payload after command byte matches firmware (`MyMesh.cpp`):
+
+`[channel_idx][path_len][path...][data_type_le16][payload...]`
+
+- `path_len=0xFF` means flood (no path bytes present)
+- otherwise `path_len` uses normal encoded path-length semantics (1/2/3-byte path hashes)
+- `data_type=0` is reserved and rejected
 
 ### Push Notifications
 
@@ -635,6 +663,19 @@ The frame server sends unsolicited push frames to the companion app when events 
 | `PUSH_CODE_TELEMETRY_RESPONSE` | 0x8B | Telemetry response |
 | `PUSH_CODE_BINARY_RESPONSE` | 0x95 | Binary request response |
 | `PUSH_CODE_PATH_DISCOVERY_RESPONSE` | 0x96 | Path discovery response |
+
+### Sync Message Responses
+
+`CMD_SYNC_NEXT_MESSAGE` can return:
+
+- `RESP_CODE_CONTACT_MSG_RECV` / `RESP_CODE_CONTACT_MSG_RECV_V3` for direct text messages
+- `RESP_CODE_CHANNEL_MSG_RECV` / `RESP_CODE_CHANNEL_MSG_RECV_V3` for channel text messages
+- `RESP_CODE_CHANNEL_DATA_RECV` (`27`) for channel binary datagrams
+- `RESP_CODE_NO_MORE_MESSAGES` when the queue is empty
+
+`RESP_CODE_CHANNEL_DATA_RECV` payload layout:
+
+`[code=27][snr][0][0][channel_idx][path_len][data_type_le16][data_len][data...]`
 
 ### Host-Callable Push Methods
 
@@ -926,6 +967,8 @@ class NodePrefs:
     airtime_factor: float = 0.0
     client_repeat: int = 0   # reported in CMD_DEVICE_QUERY device info frame (byte 80)
     path_hash_mode: int = 0   # 0=1-byte, 1=2-byte, 2=3-byte path hashes for flood packets (byte 81)
+    default_scope_name: str = ""   # persisted default scope label (v1.15)
+    default_scope_key: bytes = b"" # persisted default scope key (16 bytes)
 ```
 
 ---

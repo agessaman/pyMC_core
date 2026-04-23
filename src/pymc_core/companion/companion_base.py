@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import logging
 import random
 import struct
@@ -30,6 +31,7 @@ from ..protocol.constants import (
     MAX_PATH_SIZE,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_CONTROL,
+    PAYLOAD_TYPE_GRP_DATA,
     PH_ROUTE_MASK,
     PUB_KEY_SIZE,
     REQ_TYPE_GET_STATUS,
@@ -39,6 +41,7 @@ from ..protocol.constants import (
     ROUTE_TYPE_TRANSPORT_FLOOD,
     TELEM_PERM_BASE,
 )
+from ..protocol.crypto import CryptoUtils
 from ..protocol.packet_utils import PathUtils
 from ..protocol.transport_keys import calc_transport_code, get_auto_key_for
 from .channel_store import ChannelStore
@@ -79,6 +82,7 @@ logger = logging.getLogger("CompanionBase")
 PUSH_CALLBACK_KEYS = [
     "message_received",
     "channel_message_received",
+    "channel_data_received",
     "advert_received",
     "contact_path_updated",
     "send_confirmed",
@@ -212,6 +216,10 @@ class CompanionBase(ABC):
         self._seen_txt: OrderedDict[str, float] = OrderedDict()
         self._seen_txt_ttl = 300
         self._seen_txt_max = 1000
+        # GRP_DATA dedup by packet hash so sync_next_message only returns one entry per packet.
+        self._seen_grp_data: OrderedDict[str, float] = OrderedDict()
+        self._seen_grp_data_ttl = 300
+        self._seen_grp_data_max = 1000
 
         # Allow subclasses to restore persisted preferences on startup.
         self._load_prefs()
@@ -545,6 +553,34 @@ class CompanionBase(ABC):
         else:
             self._flood_transport_key = None
 
+    def set_default_flood_scope(
+        self,
+        scope_name: Optional[str],
+        transport_key: Optional[bytes],
+    ) -> bool:
+        """Persist default flood scope (v1.15 companion protocol semantics)."""
+        if not scope_name or not transport_key or len(transport_key) < 16:
+            self.prefs.default_scope_name = ""
+            self.prefs.default_scope_key = b""
+            self._save_prefs()
+            return True
+        normalized = scope_name[:30].strip()
+        if not normalized:
+            return False
+        self.prefs.default_scope_name = normalized
+        self.prefs.default_scope_key = bytes(transport_key[:16])
+        self._save_prefs()
+        return True
+
+    def get_default_flood_scope(self) -> Optional[tuple[str, bytes]]:
+        """Return (name, key) for persisted default scope, or None if unset."""
+        name = (getattr(self.prefs, "default_scope_name", "") or "").strip()
+        key = getattr(self.prefs, "default_scope_key", b"") or b""
+        key = bytes(key[:16]).ljust(16, b"\x00") if key else b""
+        if not name or key == b"\x00" * 16:
+            return None
+        return (name, key)
+
     def set_flood_region(self, region_name: Optional[str] = None) -> None:
         """Set flood scope from a region name (e.g., ``'#usa'``) or clear it.
 
@@ -559,6 +595,15 @@ class CompanionBase(ABC):
         else:
             self._flood_transport_key = None
 
+    def _resolve_flood_transport_key(self) -> Optional[bytes]:
+        """Resolve effective flood key: transient key first, then persisted default."""
+        if self._flood_transport_key is not None:
+            return self._flood_transport_key
+        default_scope = self.get_default_flood_scope()
+        if default_scope is None:
+            return None
+        return default_scope[1]
+
     def _apply_flood_scope(self, pkt: Packet) -> None:
         """Apply flood scope transport codes to a packet in-place.
 
@@ -568,12 +613,13 @@ class CompanionBase(ABC):
 
         Matches firmware ``sendFloodScoped()`` in ``BaseChatMesh.cpp``.
         """
-        if self._flood_transport_key is None:
+        effective_key = self._resolve_flood_transport_key()
+        if effective_key is None:
             return
         route_type = pkt.get_route_type()
         if route_type != ROUTE_TYPE_FLOOD:
             return  # only scope flood packets, not direct
-        code = calc_transport_code(self._flood_transport_key, pkt)
+        code = calc_transport_code(effective_key, pkt)
         pkt.transport_codes[0] = code
         pkt.transport_codes[1] = 0  # reserved for home region (firmware TODO)
         # Switch route type from FLOOD -> TRANSPORT_FLOOD
@@ -747,6 +793,9 @@ class CompanionBase(ABC):
 
     def on_channel_message_received(self, callback: Callable) -> None:
         self._push_callbacks["channel_message_received"].append(callback)
+
+    def on_channel_data_received(self, callback: Callable) -> None:
+        self._push_callbacks["channel_data_received"].append(callback)
 
     def on_advert_received(self, callback: Callable) -> None:
         self._push_callbacks["advert_received"].append(callback)
@@ -1274,6 +1323,63 @@ class CompanionBase(ABC):
             return success
         except Exception as e:
             logger.error(f"Error sending channel message: {e}")
+            self.stats.record_tx_error()
+            return False
+
+    async def send_channel_data(
+        self,
+        channel_idx: int,
+        data_type: int,
+        payload: bytes,
+        *,
+        path: Optional[bytes] = None,
+        path_len_encoded: Optional[int] = None,
+    ) -> bool:
+        """Send a group binary datagram (PAYLOAD_TYPE_GRP_DATA)."""
+        channel = self.channels.get(channel_idx)
+        if not channel or data_type <= 0 or data_type > 0xFFFF:
+            return False
+        payload = bytes(payload or b"")
+        if len(payload) > 255:
+            return False
+        try:
+            secret_bytes = bytes(channel.secret or b"")
+            if len(secret_bytes) < 32:
+                secret_bytes = secret_bytes + b"\x00" * (32 - len(secret_bytes))
+            else:
+                secret_bytes = secret_bytes[:32]
+
+            hash_input = (
+                secret_bytes[:16]
+                if len(secret_bytes) >= 32 and secret_bytes[16:32] == b"\x00" * 16
+                else secret_bytes
+            )
+            channel_hash = hashlib.sha256(hash_input).digest()[0]
+            plaintext = struct.pack("<HB", data_type & 0xFFFF, len(payload)) + payload
+            pkt = PacketBuilder.create_group_data_packet(
+                PAYLOAD_TYPE_GRP_DATA,
+                channel_hash,
+                secret_bytes,
+                plaintext,
+                secret_bytes,
+            )
+
+            is_flood = path_len_encoded in (None, 0xFF)
+            if is_flood:
+                self._apply_flood_scope(pkt)
+            else:
+                pkt.header = (pkt.header & ~PH_ROUTE_MASK) | ROUTE_TYPE_DIRECT
+                pkt.set_path(path or b"", path_len_encoded=path_len_encoded)
+            self._apply_path_hash_mode(pkt)
+
+            success = await self._send_packet(pkt, wait_for_ack=False)
+            if success:
+                self.stats.record_tx(is_flood=is_flood)
+            else:
+                self.stats.record_tx_error()
+            return success
+        except Exception as e:
+            logger.error(f"Error sending channel data: {e}")
             self.stats.record_tx_error()
             return False
 
@@ -1831,6 +1937,95 @@ class CompanionBase(ABC):
             path_len,
             channel_idx,
             pkt_hash,
+            snr,
+            rssi,
+        )
+
+    def _get_channel_candidates_by_hash(self, channel_hash: int) -> list[tuple[int, Channel]]:
+        """Return channel candidates that match the 1-byte channel hash."""
+        matches: list[tuple[int, Channel]] = []
+        max_channels = getattr(self.channels, "max_channels", 40)
+        for idx in range(max_channels):
+            channel = self.channels.get(idx)
+            if channel is None:
+                continue
+            secret = bytes(channel.secret or b"")
+            if len(secret) < 32:
+                secret = secret + b"\x00" * (32 - len(secret))
+            else:
+                secret = secret[:32]
+            hash_input = secret[:16] if secret[16:32] == b"\x00" * 16 else secret
+            if hashlib.sha256(hash_input).digest()[0] == channel_hash:
+                matches.append((idx, channel))
+        return matches
+
+    async def _handle_group_data_packet(self, packet: Packet) -> None:
+        """Parse and queue incoming PAYLOAD_TYPE_GRP_DATA for sync_next_message."""
+        payload = packet.get_payload()
+        if len(payload) < 4:
+            return
+        packet_hash = packet.calculate_packet_hash().hex().upper()
+        if self._check_dedup(
+            self._seen_grp_data,
+            packet_hash,
+            self._seen_grp_data_ttl,
+            self._seen_grp_data_max,
+        ):
+            return
+
+        channel_hash = payload[0]
+        cipher_mac = payload[1:3]
+        ciphertext = payload[3:]
+        selected_idx: Optional[int] = None
+        plaintext: Optional[bytes] = None
+
+        for idx, channel in self._get_channel_candidates_by_hash(channel_hash):
+            secret = bytes(channel.secret or b"")
+            if len(secret) < 32:
+                secret = secret + b"\x00" * (32 - len(secret))
+            else:
+                secret = secret[:32]
+            try:
+                plaintext = CryptoUtils.mac_then_decrypt(hashlib.sha256(secret).digest(), secret, cipher_mac + ciphertext)
+            except Exception:
+                plaintext = None
+            if plaintext is not None:
+                selected_idx = idx
+                break
+
+        if selected_idx is None or plaintext is None or len(plaintext) < 3:
+            return
+        data_type = struct.unpack_from("<H", plaintext, 0)[0]
+        data_len = plaintext[2]
+        if data_type == 0 or len(plaintext) < 3 + data_len:
+            return
+        blob = bytes(plaintext[3 : 3 + data_len])
+
+        route_type = packet.get_route_type()
+        path_len = packet.path_len if route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD) else 0xFF
+        snr = packet.get_snr() if hasattr(packet, "get_snr") else getattr(packet, "_snr", 0.0)
+        rssi = packet.rssi if hasattr(packet, "rssi") else getattr(packet, "_rssi", 0)
+        queued = QueuedMessage(
+            sender_key=b"",
+            txt_type=0,
+            timestamp=0,
+            text="",
+            is_channel=True,
+            channel_idx=selected_idx,
+            path_len=path_len,
+            snr=snr if snr is not None else 0.0,
+            rssi=rssi if rssi is not None else 0,
+            channel_data_type=data_type,
+            channel_data_payload=blob,
+        )
+        self.message_queue.push(queued)
+        await self._fire_callbacks(
+            "channel_data_received",
+            selected_idx,
+            path_len,
+            data_type,
+            blob,
+            packet_hash,
             snr,
             rssi,
         )
