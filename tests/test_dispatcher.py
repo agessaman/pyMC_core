@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -651,6 +651,29 @@ class TestDispatcherMaintenance:
 
         # Verify cleanup was called
         dispatcher.packet_filter.cleanup_old_hashes.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_run_forever_health_check_uses_to_thread(self, dispatcher):
+        """Health checks should run via asyncio.to_thread to avoid loop blocking."""
+        dispatcher.radio.check_radio_health = Mock(return_value=True)
+
+        sleep_calls = {"count": 0}
+
+        async def fake_sleep(_seconds):
+            sleep_calls["count"] += 1
+            if sleep_calls["count"] >= 60:
+                raise asyncio.CancelledError()
+
+        to_thread_mock = AsyncMock(return_value=True)
+
+        with (
+            patch("pymc_core.node.dispatcher.asyncio.sleep", side_effect=fake_sleep),
+            patch("pymc_core.node.dispatcher.asyncio.to_thread", to_thread_mock),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await dispatcher.run_forever()
+
+        to_thread_mock.assert_awaited_once_with(dispatcher.radio.check_radio_health)
 
 
 class TestDispatcherErrorHandling:

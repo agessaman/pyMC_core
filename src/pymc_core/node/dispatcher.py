@@ -676,7 +676,7 @@ class Dispatcher:
             if health_check_counter >= 60:
                 health_check_counter = 0
                 if hasattr(self.radio, "check_radio_health"):
-                    self.radio.check_radio_health()
+                    await asyncio.to_thread(self.radio.check_radio_health)
 
             # With callback-based RX, just do maintenance tasks
             await asyncio.sleep(1.0)  # Check every second for cleanup

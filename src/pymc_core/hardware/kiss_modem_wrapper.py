@@ -221,6 +221,15 @@ class KissModemWrapper(LoRaRadio):
         specific packet, avoiding race conditions with get_last_rssi/get_last_snr.
     """
 
+    # Some SetHardware requests may legitimately respond with OK instead of the
+    # command|0x80 specific response code.
+    _SETHW_ALLOW_OK_FOR: set[int] = {
+        HW_CMD_SET_RADIO,
+        HW_CMD_SET_TX_POWER,
+        HW_CMD_SET_SIGNAL_REPORT,
+        HW_CMD_REBOOT,
+    }
+
     def __init__(
         self,
         port: str,
@@ -295,9 +304,14 @@ class KissModemWrapper(LoRaRadio):
         self._callback_executor: Optional[ThreadPoolExecutor] = None
 
         # Response handling
+        # Single-flight SetHardware command execution (send -> wait -> return)
+        self._command_lock = threading.Lock()
         self._response_event = threading.Event()
         self._pending_response: Optional[tuple[int, bytes]] = None
         self._response_lock = threading.Lock()
+        self._expected_response_subcmds: Optional[set[int]] = None
+        self._active_request_subcmd: Optional[int] = None
+        self._response_queue: deque[tuple[int, bytes]] = deque(maxlen=32)
 
         # TX completion tracking
         self._tx_done_event = threading.Event()
@@ -734,33 +748,67 @@ class KissModemWrapper(LoRaRadio):
         Returns:
             Tuple of (response_sub_cmd, response_data) or None on timeout
         """
-        with self._response_lock:
-            self._response_event.clear()
-            self._pending_response = None
+        # Ensure SetHardware requests are single-flight. This prevents concurrent
+        # callers from clearing the shared waiter state or stealing responses.
+        with self._command_lock:
+            expected = sub_cmd | 0x80
+            acceptable: set[int] = {expected, HW_RESP_ERROR}
+            if sub_cmd in self._SETHW_ALLOW_OK_FOR:
+                acceptable.add(HW_RESP_OK)
 
-        # SetHardware frame: type 0x06, payload = sub_cmd (1 byte) + data
-        kiss_frame = self._encode_kiss_frame(KISS_CMD_SETHARDWARE, bytes([sub_cmd]) + data)
-
-        if not self._write_frame(kiss_frame):
-            logger.warning("SetHardware frame write failed")
-            return None
-
-        # Wait for response
-        if self._response_event.wait(timeout):
+            # Check queued responses first (late/out-of-order arrivals).
             with self._response_lock:
-                return self._pending_response
-        else:
-            logger.warning(f"SetHardware sub_cmd 0x{sub_cmd:02X} timeout")
-            return None
+                if self._response_queue:
+                    n = len(self._response_queue)
+                    matched: Optional[tuple[int, bytes]] = None
+                    for _ in range(n):
+                        resp_sub, resp_payload = self._response_queue.popleft()
+                        if matched is None and resp_sub in acceptable:
+                            matched = (resp_sub, resp_payload)
+                        else:
+                            self._response_queue.append((resp_sub, resp_payload))
+                    if matched is not None:
+                        return matched
 
-    def get_radio_config(self) -> Optional[Dict[str, Any]]:
+                self._response_event.clear()
+                self._pending_response = None
+                self._expected_response_subcmds = acceptable
+                self._active_request_subcmd = sub_cmd
+
+            try:
+                # SetHardware frame: type 0x06, payload = sub_cmd (1 byte) + data
+                kiss_frame = self._encode_kiss_frame(KISS_CMD_SETHARDWARE, bytes([sub_cmd]) + data)
+
+                if not self._write_frame(kiss_frame):
+                    logger.warning("SetHardware frame write failed")
+                    return None
+
+                # Wait for response (RX thread will only signal on acceptable sub_cmd)
+                if self._response_event.wait(timeout):
+                    with self._response_lock:
+                        return self._pending_response
+
+                logger.warning(f"SetHardware sub_cmd 0x{sub_cmd:02X} timeout")
+                return None
+            finally:
+                with self._response_lock:
+                    self._expected_response_subcmds = None
+                    self._active_request_subcmd = None
+
+    def get_radio_config(self, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
         """
-        Get current radio configuration from modem
+        Get current radio configuration from modem.
+
+        Blocks the caller thread for up to ``timeout`` seconds (default RESPONSE_TIMEOUT).
+
+        Args:
+            timeout: SetHardware response wait in seconds, or None for RESPONSE_TIMEOUT.
 
         Returns:
             Dict with frequency, bandwidth, sf, cr, or None on error
         """
-        resp = self._send_command(CMD_GET_RADIO)
+        t = timeout if timeout is not None else RESPONSE_TIMEOUT
+        resp = self._send_command(CMD_GET_RADIO, timeout=t)
         if resp and resp[0] == RESP_RADIO and len(resp[1]) >= 10:
             freq, bw, sf, cr = struct.unpack("<IIBB", resp[1][:10])
             return {
@@ -792,16 +840,30 @@ class KissModemWrapper(LoRaRadio):
             logger.error(f"Error setting TX power: {e}")
             return False
 
-    def get_tx_power(self) -> Optional[int]:
-        """Get current TX power in dBm"""
-        resp = self._send_command(CMD_GET_TX_POWER)
+    def get_tx_power(self, timeout: Optional[float] = None) -> Optional[int]:
+        """Get current TX power in dBm.
+
+        Blocks the caller thread for up to ``timeout`` seconds (default RESPONSE_TIMEOUT).
+
+        Args:
+            timeout: SetHardware response wait in seconds, or None for RESPONSE_TIMEOUT.
+        """
+        t = timeout if timeout is not None else RESPONSE_TIMEOUT
+        resp = self._send_command(CMD_GET_TX_POWER, timeout=t)
         if resp and resp[0] == RESP_TX_POWER and len(resp[1]) >= 1:
             return resp[1][0]
         return None
 
-    def get_current_rssi(self) -> int:
-        """Get current RSSI from modem"""
-        resp = self._send_command(CMD_GET_CURRENT_RSSI)
+    def get_current_rssi(self, timeout: Optional[float] = None) -> int:
+        """Get current RSSI from modem.
+
+        Blocks the caller thread for up to ``timeout`` seconds (default RESPONSE_TIMEOUT).
+
+        Args:
+            timeout: SetHardware response wait in seconds, or None for RESPONSE_TIMEOUT.
+        """
+        t = timeout if timeout is not None else RESPONSE_TIMEOUT
+        resp = self._send_command(CMD_GET_CURRENT_RSSI, timeout=t)
         if resp and resp[0] == RESP_CURRENT_RSSI and len(resp[1]) >= 1:
             # RSSI is signed byte
             rssi = resp[1][0]
@@ -810,9 +872,16 @@ class KissModemWrapper(LoRaRadio):
             return rssi
         return -999
 
-    def is_channel_busy(self) -> bool:
-        """Check if channel is busy"""
-        resp = self._send_command(CMD_IS_CHANNEL_BUSY)
+    def is_channel_busy(self, timeout: Optional[float] = None) -> bool:
+        """Check if channel is busy.
+
+        Blocks the caller thread for up to ``timeout`` seconds (default RESPONSE_TIMEOUT).
+
+        Args:
+            timeout: SetHardware response wait in seconds, or None for RESPONSE_TIMEOUT.
+        """
+        t = timeout if timeout is not None else RESPONSE_TIMEOUT
+        resp = self._send_command(CMD_IS_CHANNEL_BUSY, timeout=t)
         if resp and resp[0] == RESP_CHANNEL_BUSY and len(resp[1]) >= 1:
             return resp[1][0] == 0x01
         return False
@@ -836,9 +905,16 @@ class KissModemWrapper(LoRaRadio):
             return struct.unpack("<I", resp[1][:4])[0]
         return None
 
-    def get_noise_floor(self) -> Optional[int]:
-        """Get noise floor in dBm"""
-        resp = self._send_command(CMD_GET_NOISE_FLOOR)
+    def get_noise_floor(self, timeout: Optional[float] = None) -> Optional[int]:
+        """Get noise floor in dBm.
+
+        Blocks the caller thread for up to ``timeout`` seconds (default RESPONSE_TIMEOUT).
+
+        Args:
+            timeout: SetHardware response wait in seconds, or None for RESPONSE_TIMEOUT.
+        """
+        t = timeout if timeout is not None else RESPONSE_TIMEOUT
+        resp = self._send_command(CMD_GET_NOISE_FLOOR, timeout=t)
         if resp and resp[0] == RESP_NOISE_FLOOR and len(resp[1]) >= 2:
             # Noise floor is signed 16-bit
             noise = struct.unpack("<h", resp[1][:2])[0]
@@ -846,22 +922,35 @@ class KissModemWrapper(LoRaRadio):
             return noise
         return None
 
-    def get_modem_stats(self) -> Optional[Dict[str, int]]:
+    def get_modem_stats(self, timeout: Optional[float] = None) -> Optional[Dict[str, int]]:
         """
-        Get modem statistics
+        Get modem statistics.
+
+        Blocks the caller thread for up to ``timeout`` seconds (default RESPONSE_TIMEOUT).
+
+        Args:
+            timeout: SetHardware response wait in seconds, or None for RESPONSE_TIMEOUT.
 
         Returns:
             Dict with rx, tx, errors counts or None on error
         """
-        resp = self._send_command(CMD_GET_STATS)
+        t = timeout if timeout is not None else RESPONSE_TIMEOUT
+        resp = self._send_command(CMD_GET_STATS, timeout=t)
         if resp and resp[0] == RESP_STATS and len(resp[1]) >= 12:
             rx, tx, errors = struct.unpack("<III", resp[1][:12])
             return {"rx": rx, "tx": tx, "errors": errors}
         return None
 
-    def get_battery(self) -> Optional[int]:
-        """Get battery voltage in millivolts"""
-        resp = self._send_command(CMD_GET_BATTERY)
+    def get_battery(self, timeout: Optional[float] = None) -> Optional[int]:
+        """Get battery voltage in millivolts.
+
+        Blocks the caller thread for up to ``timeout`` seconds (default RESPONSE_TIMEOUT).
+
+        Args:
+            timeout: SetHardware response wait in seconds, or None for RESPONSE_TIMEOUT.
+        """
+        t = timeout if timeout is not None else RESPONSE_TIMEOUT
+        resp = self._send_command(CMD_GET_BATTERY, timeout=t)
         if resp and resp[0] == RESP_BATTERY and len(resp[1]) >= 2:
             return struct.unpack("<H", resp[1][:2])[0]
         return None
@@ -1169,7 +1258,8 @@ class KissModemWrapper(LoRaRadio):
 
         # Use short timeout for GET_AIRTIME so TX path is not blocked if modem
         # is busy or unresponsive (avoids 5s stall and subsequent bad state).
-        airtime = self.get_airtime(len(data), timeout=1.0)
+        # Run off the event loop: get_airtime uses blocking SetHardware wait.
+        airtime = await asyncio.to_thread(self.get_airtime, len(data), 1.0)
         if airtime is None:
             airtime = int(PacketTimingUtils.estimate_airtime_ms(len(data), self.radio_config))
         return {
@@ -1226,10 +1316,10 @@ class KissModemWrapper(LoRaRadio):
         """Get interface statistics"""
         return self.stats.copy()
 
-    def get_status(self) -> Dict[str, Any]:
-        """Get radio status. Uses cached config/stats where possible."""
-        cfg = self.get_radio_config()
-        tx_power = self.get_tx_power()
+    def _sync_get_status(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Build radio status dict (blocking SetHardware reads for config and TX power)."""
+        cfg = self.get_radio_config(timeout=timeout)
+        tx_power = self.get_tx_power(timeout=timeout)
         status: Dict[str, Any] = {
             "initialized": self.is_connected,
             "frequency": cfg["frequency"] if cfg else self.radio_config.get("frequency", 0),
@@ -1247,6 +1337,54 @@ class KissModemWrapper(LoRaRadio):
             "hardware_ready": self.is_connected,
         }
         return status
+
+    def get_status(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Get radio status. Queries modem for config and TX power; blocks the caller thread.
+
+        Args:
+            timeout: Per-query SetHardware timeout in seconds for each modem read
+                (default RESPONSE_TIMEOUT).
+        """
+        return self._sync_get_status(timeout)
+
+    async def get_status_async(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Get radio status without blocking the asyncio event loop.
+
+        Runs blocking modem I/O in ``asyncio``'s default thread pool executor.
+        """
+        return await asyncio.to_thread(self._sync_get_status, timeout)
+
+    async def get_radio_config_async(
+        self, timeout: Optional[float] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Async-safe :meth:`get_radio_config`; runs blocking modem I/O in a worker thread."""
+        return await asyncio.to_thread(self.get_radio_config, timeout)
+
+    async def get_tx_power_async(self, timeout: Optional[float] = None) -> Optional[int]:
+        """Async-safe :meth:`get_tx_power`; runs blocking modem I/O in a worker thread."""
+        return await asyncio.to_thread(self.get_tx_power, timeout)
+
+    async def get_current_rssi_async(self, timeout: Optional[float] = None) -> int:
+        """Async-safe :meth:`get_current_rssi`; runs blocking modem I/O in a worker thread."""
+        return await asyncio.to_thread(self.get_current_rssi, timeout)
+
+    async def is_channel_busy_async(self, timeout: Optional[float] = None) -> bool:
+        """Async-safe :meth:`is_channel_busy`; runs blocking modem I/O in a worker thread."""
+        return await asyncio.to_thread(self.is_channel_busy, timeout)
+
+    async def get_noise_floor_async(self, timeout: Optional[float] = None) -> Optional[int]:
+        """Async-safe :meth:`get_noise_floor`; runs blocking modem I/O in a worker thread."""
+        return await asyncio.to_thread(self.get_noise_floor, timeout)
+
+    async def get_modem_stats_async(
+        self, timeout: Optional[float] = None
+    ) -> Optional[Dict[str, int]]:
+        """Async-safe :meth:`get_modem_stats`; runs blocking modem I/O in a worker thread."""
+        return await asyncio.to_thread(self.get_modem_stats, timeout)
+
+    async def get_battery_async(self, timeout: Optional[float] = None) -> Optional[int]:
+        """Async-safe :meth:`get_battery`; runs blocking modem I/O in a worker thread."""
+        return await asyncio.to_thread(self.get_battery, timeout)
 
     # KISS frame encoding/decoding
 
@@ -1428,14 +1566,32 @@ class KissModemWrapper(LoRaRadio):
                     self.stats["errors"] += 1
                     logger.warning(f"Modem error: 0x{payload[0]:02X}")
                 with self._response_lock:
-                    self._pending_response = (sub_cmd, payload)
-                    self._response_event.set()
+                    expected = self._expected_response_subcmds
+                    if expected is not None and sub_cmd in expected:
+                        self._pending_response = (sub_cmd, payload)
+                        self._response_event.set()
+                    else:
+                        if len(self._response_queue) == self._response_queue.maxlen:
+                            logger.debug(
+                                "Dropping oldest SetHardware response (queue full); sub_cmd=0x%02X",
+                                sub_cmd,
+                            )
+                        self._response_queue.append((sub_cmd, payload))
 
             else:
                 # Other response sub-commands (Identity, Radio, OK, etc.)
                 with self._response_lock:
-                    self._pending_response = (sub_cmd, payload)
-                    self._response_event.set()
+                    expected = self._expected_response_subcmds
+                    if expected is not None and sub_cmd in expected:
+                        self._pending_response = (sub_cmd, payload)
+                        self._response_event.set()
+                    else:
+                        if len(self._response_queue) == self._response_queue.maxlen:
+                            logger.debug(
+                                "Dropping oldest SetHardware response (queue full); sub_cmd=0x%02X",
+                                sub_cmd,
+                            )
+                        self._response_queue.append((sub_cmd, payload))
         # cmd 0xFF (Return) has port=15 so is already discarded above
 
     def _rx_worker(self):
