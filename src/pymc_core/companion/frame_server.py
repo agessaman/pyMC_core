@@ -1060,6 +1060,7 @@ class CompanionFrameServer:
             return
         txt_type = data[0]
         attempt = data[1]
+        msg_timestamp = int.from_bytes(data[2:6], "little")
         pubkey_prefix = data[6:12]
         text = data[12:].decode("utf-8", errors="replace").rstrip("\x00")
         contact = self.bridge.contacts.get_by_key_prefix(pubkey_prefix)
@@ -1072,7 +1073,12 @@ class CompanionFrameServer:
             else bytes.fromhex(contact.public_key)
         )
         result = await self.bridge.send_text_message(
-            pubkey, text, txt_type=txt_type, attempt=attempt + 1, wait_for_ack=False
+            pubkey,
+            text,
+            txt_type=txt_type,
+            attempt=attempt,
+            timestamp=msg_timestamp,
+            wait_for_ack=False,
         )
         if result.success:
             ack = result.expected_ack or 0

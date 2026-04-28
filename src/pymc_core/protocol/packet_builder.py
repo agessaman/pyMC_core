@@ -743,6 +743,7 @@ class PacketBuilder:
         message_type: str = "direct",
         out_path: Optional[list] = None,
         txt_type: int = 0,
+        timestamp: Optional[int] = None,
     ) -> tuple[Packet, int]:
         """
         Create a secure text message with encryption and CRC validation.
@@ -760,6 +761,9 @@ class PacketBuilder:
             txt_type: Text type in upper 6 bits of the flags byte (0=PLAIN, 1=CLI_DATA, …),
                 combined with attempt as ``(txt_type << 2) | (attempt & 3)``. Matches MeshCore
                 ``TXT_TYPE_*`` so repeaters skip delivery ACK for CLI_DATA.
+            timestamp: Optional explicit message timestamp. When omitted, uses current epoch
+                seconds. Providing this allows deterministic resend semantics that match
+                companion firmware behavior.
 
         Returns:
             tuple: (packet, crc) - The encrypted packet and CRC for ACK verification.
@@ -775,13 +779,18 @@ class PacketBuilder:
             # Returns: 0
             ```
         """
-        attempt &= 0x03
+        original_attempt = int(attempt) & 0xFF
         txt_type &= 0x3F
-        flags_byte = (txt_type << 2) | attempt
-        timestamp = PacketBuilder._get_timestamp()
+        flags_byte = (txt_type << 2) | (original_attempt & 0x03)
+        if timestamp is None:
+            timestamp = PacketBuilder._get_timestamp()
 
-        # Use  timestamp+data packing
-        plaintext = PacketBuilder._pack_timestamp_data(timestamp, flags_byte, message, b"\x00")
+        # MeshCore payload format:
+        # - base: timestamp(4) + flags(1) + message bytes (no trailing NUL)
+        # - if attempt > 3: append NUL + full attempt byte at tail
+        plaintext = PacketBuilder._pack_timestamp_data(timestamp, flags_byte, message)
+        if original_attempt > 3:
+            plaintext += b"\x00" + bytes([original_attempt])
 
         # Use  encryption and payload creation
         payload, shared_secret, aes_key = PacketBuilder._create_encrypted_payload(
@@ -847,7 +856,7 @@ class PacketBuilder:
         logger.debug(f"  Path: {list(pkt.path)} (len={pkt.path_len})")
         logger.debug(f"  Payload: {len(pkt.payload)} bytes, first 10: {list(pkt.payload[:10])}")
         logger.debug(
-            f"  Message: '{message}', attempt={attempt}, txt_type={txt_type}, "
+            f"  Message: '{message}', attempt={original_attempt}, txt_type={txt_type}, "
             f"flags=0x{flags_byte:02X}, timestamp={timestamp}"
         )
         logger.debug(f"  CRC: 0x{ack_crc:08X}")

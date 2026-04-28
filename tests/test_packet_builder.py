@@ -173,6 +173,96 @@ def test_create_text_message_cli_data_flags_byte():
     assert crc_plain != crc_cli
 
 
+def test_create_text_message_same_inputs_keep_same_hash():
+    """With explicit timestamp, same DM inputs produce same packet hash."""
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = type(
+        "Contact",
+        (),
+        {
+            "public_key": other.get_public_key().hex(),
+            "out_path": [],
+            "out_path_len": -1,
+        },
+    )()
+    ts = 1_700_000_000
+
+    pkt_a, crc_a = PacketBuilder.create_text_message(
+        contact, local, "same-hash", attempt=2, message_type="direct", timestamp=ts
+    )
+    pkt_b, crc_b = PacketBuilder.create_text_message(
+        contact, local, "same-hash", attempt=2, message_type="direct", timestamp=ts
+    )
+
+    assert pkt_a.calculate_packet_hash() == pkt_b.calculate_packet_hash()
+    assert crc_a == crc_b
+
+
+def test_create_text_message_timestamp_change_changes_hash():
+    """Changing DM timestamp changes payload and packet hash."""
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = type(
+        "Contact",
+        (),
+        {
+            "public_key": other.get_public_key().hex(),
+            "out_path": [],
+            "out_path_len": -1,
+        },
+    )()
+
+    pkt_a, _ = PacketBuilder.create_text_message(
+        contact, local, "time-delta", attempt=1, message_type="direct", timestamp=1_700_000_100
+    )
+    pkt_b, _ = PacketBuilder.create_text_message(
+        contact, local, "time-delta", attempt=1, message_type="direct", timestamp=1_700_000_101
+    )
+
+    assert pkt_a.calculate_packet_hash() != pkt_b.calculate_packet_hash()
+
+
+def test_create_text_message_attempt_gt3_adds_tail_bytes():
+    """Firmware parity: attempt>3 adds NUL+attempt tail but ACK CRC uses low 2 bits only."""
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = type(
+        "Contact",
+        (),
+        {
+            "public_key": other.get_public_key().hex(),
+            "out_path": [],
+            "out_path_len": -1,
+        },
+    )()
+    ts = 1_700_000_200
+    msg = "retry-me"
+
+    pkt_attempt0, crc_attempt0 = PacketBuilder.create_text_message(
+        contact, local, msg, attempt=0, message_type="direct", timestamp=ts
+    )
+    pkt_attempt4, crc_attempt4 = PacketBuilder.create_text_message(
+        contact, local, msg, attempt=4, message_type="direct", timestamp=ts
+    )
+
+    peer_pub = local.get_public_key()
+    secret = Identity(peer_pub).calc_shared_secret(other.get_private_key())
+    aes_key = secret[:16]
+    dec_attempt0 = CryptoUtils.mac_then_decrypt(aes_key, secret, bytes(pkt_attempt0.payload[2:]))
+    dec_attempt4 = CryptoUtils.mac_then_decrypt(aes_key, secret, bytes(pkt_attempt4.payload[2:]))
+
+    # flags byte low bits stay attempt&0x03; message body differs for >3 attempts.
+    assert dec_attempt0[4] == 0x00
+    assert dec_attempt4[4] == 0x00
+    assert dec_attempt0[5:].startswith(msg.encode("utf-8"))
+    assert dec_attempt4[5:].startswith(msg.encode("utf-8") + b"\x00\x04")
+
+    # ACK CRC parity with firmware: computed from low 2-bit attempt only.
+    assert crc_attempt0 == crc_attempt4
+    assert pkt_attempt0.calculate_packet_hash() != pkt_attempt4.calculate_packet_hash()
+
+
 def test_create_text_message_truncated_path_path_len_consistency():
     """When contact has 64-byte path but out_path_len encodes more than 64 bytes
     (e.g. 33 hops × 2-byte = 66), do not use contact_path_len; use 1-byte

@@ -1,5 +1,7 @@
 """Tests for CompanionRadio (stand-alone companion with radio)."""
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from pymc_core.companion import CompanionRadio
@@ -209,6 +211,24 @@ class TestCompanionRadioSendText:
         assert len(radio.sent) >= 1
         # success may be False if no ACK (mock radio doesn't echo ACK)
         assert result.success is False or result.success is True
+
+    async def test_send_text_message_wait_for_ack_uses_expected_ack_crc(self):
+        """DM send should pass packet-builder ACK CRC into dispatcher expected_crc."""
+        radio = MockRadio()
+        comp = CompanionRadio(radio, LocalIdentity())
+        contact = _make_peer_contact("Alice")
+        comp.contacts.add(contact)
+
+        comp.node.dispatcher.send_packet = AsyncMock(return_value=True)
+
+        result = await comp.send_text_message(contact.public_key, "Hello", wait_for_ack=True)
+
+        assert result.success is True
+        assert result.expected_ack is not None
+        comp.node.dispatcher.send_packet.assert_awaited_once()
+        _, kwargs = comp.node.dispatcher.send_packet.await_args
+        assert kwargs["wait_for_ack"] is True
+        assert kwargs["expected_crc"] == result.expected_ack
 
 
 # ---------------------------------------------------------------------------

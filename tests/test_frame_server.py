@@ -121,6 +121,56 @@ class _MockBridgeSendRawDirect:
         return SentResult(success=self._success)
 
 
+class _MockBridgeSendText:
+    """Minimal bridge for CMD_SEND_TXT_MSG tests."""
+
+    def __init__(self, contact: Contact):
+        self.contacts = Mock()
+        self.contacts.get_by_key_prefix = Mock(return_value=contact)
+        self.send_text_message = AsyncMock(
+            return_value=SentResult(
+                success=True,
+                is_flood=False,
+                expected_ack=0x12345678,
+                timeout_ms=4000,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_txt_msg_forwards_attempt_and_timestamp():
+    """Frame server must forward DM attempt/timestamp unchanged for deterministic retries."""
+    from pymc_core.companion.constants import RESP_CODE_SENT
+
+    peer_pub = bytes([0x11] * 32)
+    contact = Contact(public_key=peer_pub, name="Alice")
+    bridge = _MockBridgeSendText(contact)
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    frames = []
+    server._write_frame = lambda f: frames.append(f)
+    server._write_err = Mock()
+
+    txt_type = 0
+    attempt = 4
+    timestamp = 1_700_000_123
+    payload = (
+        bytes([txt_type, attempt]) + struct.pack("<I", timestamp) + peer_pub[:6] + b"retry me\x00"
+    )
+
+    await server._cmd_send_txt_msg(payload)
+
+    bridge.send_text_message.assert_awaited_once()
+    args, kwargs = bridge.send_text_message.await_args
+    assert args[0] == peer_pub
+    assert args[1] == "retry me"
+    assert kwargs["txt_type"] == txt_type
+    assert kwargs["attempt"] == attempt
+    assert kwargs["timestamp"] == timestamp
+    assert kwargs["wait_for_ack"] is False
+    assert any(frame[0] == RESP_CODE_SENT for frame in frames)
+    server._write_err.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_cmd_send_raw_data_valid_writes_ok():
     """Valid CMD_SEND_RAW_DATA -> _write_ok."""

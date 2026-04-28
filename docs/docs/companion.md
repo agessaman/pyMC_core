@@ -172,6 +172,12 @@ msg = companion.sync_next_message()  # -> QueuedMessage | None
 result = await companion.send_raw_data(dest_key, data=b"\x01\x02", path=None)
 ```
 
+DM packet hashes are payload-deterministic (firmware parity), not guaranteed unique per send.
+For `TXT_MSG`, hash identity is driven by the encrypted payload bytes (derived from timestamp,
+flags/attempt bits, text, and keys). Reusing the same `timestamp`/`attempt`/`text` can reuse
+the same packet hash; changing those fields yields a new hash. Use `timestamp=` in
+`send_text_message(...)` when you need deterministic retry behavior.
+
 ### Advertisements
 
 ```python

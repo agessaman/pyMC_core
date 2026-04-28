@@ -99,9 +99,18 @@ class CompanionRadio(CompanionBase):
     # Abstract method implementations
     # -------------------------------------------------------------------------
 
-    async def _send_packet(self, pkt: Packet, wait_for_ack: bool = False) -> bool:
+    async def _send_packet(
+        self,
+        pkt: Packet,
+        wait_for_ack: bool = False,
+        expected_crc: int | None = None,
+    ) -> bool:
         """Send a packet via the MeshNode dispatcher."""
-        return await self.node.dispatcher.send_packet(pkt, wait_for_ack=wait_for_ack)
+        return await self.node.dispatcher.send_packet(
+            pkt,
+            wait_for_ack=wait_for_ack,
+            expected_crc=expected_crc,
+        )
 
     # -------------------------------------------------------------------------
     # Handler accessors (used by CompanionBase concrete send methods)

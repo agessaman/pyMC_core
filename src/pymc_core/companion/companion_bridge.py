@@ -314,9 +314,24 @@ class CompanionBridge(CompanionBase):
     # Abstract method implementations
     # -------------------------------------------------------------------------
 
-    async def _send_packet(self, pkt: Packet, wait_for_ack: bool = False) -> bool:
+    async def _send_packet(
+        self,
+        pkt: Packet,
+        wait_for_ack: bool = False,
+        expected_crc: int | None = None,
+    ) -> bool:
         """Send a packet via the packet_injector."""
-        return await self._packet_injector(pkt, wait_for_ack=wait_for_ack)
+        try:
+            return await self._packet_injector(
+                pkt,
+                wait_for_ack=wait_for_ack,
+                expected_crc=expected_crc,
+            )
+        except TypeError as exc:
+            # Backward compatibility for injectors that have not yet adopted expected_crc.
+            if "expected_crc" not in str(exc):
+                raise
+            return await self._packet_injector(pkt, wait_for_ack=wait_for_ack)
 
     # -------------------------------------------------------------------------
     # Lifecycle
