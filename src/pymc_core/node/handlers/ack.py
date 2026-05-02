@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Awaitable, Callable, Optional
 
-from ...protocol import Packet
+from ...protocol import CryptoUtils, Identity, Packet
 from ...protocol.constants import PAYLOAD_TYPE_ACK
 from ...protocol.packet_utils import PathUtils
 from .base import BaseHandler
@@ -35,6 +35,19 @@ class AckHandler(BaseHandler):
     def set_dispatcher(self, dispatcher):
         """Set dispatcher reference for contact lookup and waiting ACKs."""
         self.dispatcher = dispatcher
+
+    @staticmethod
+    def _contact_pubkey_bytes(contact: object) -> Optional[bytes]:
+        pk = getattr(contact, "public_key", None)
+        if pk is None:
+            return None
+        if isinstance(pk, bytes):
+            return pk if len(pk) == 32 else None
+        try:
+            b = bytes.fromhex(pk) if isinstance(pk, str) else bytes(pk)
+            return b if len(b) == 32 else None
+        except (ValueError, TypeError):
+            return None
 
     async def __call__(self, packet: Packet) -> None:
         """Handle discrete ACK packets (payload type 1)."""
@@ -71,12 +84,19 @@ class AckHandler(BaseHandler):
         self.log(f"Processing PATH packet for ACKs: payload_len={len(payload)}")
         self.log(f"PATH payload (hex): {payload.hex().upper()}")
 
-        # Check for encrypted ACK responses (20-byte PATH packets addressed to us)
+        # Primary: decrypt standard Mesh PATH (dest+src+MAC+ciphertext); inner layout is
+        # path_len + path + extra_type + extra (e.g. flood TXT_MSG ACK in extra).
+        ack_crc = await self._ack_crc_from_encrypted_path(packet)
+        if ack_crc is not None:
+            self.log(f"Found PATH-carried ACK (decrypted): CRC={ack_crc:08X}")
+            return ack_crc
+
+        # Narrow fallback: 20-byte PATH + dispatcher blocking on wait_for_ack (scan plaintext)
         if (
             len(payload) == 20
-            and self.dispatcher._waiting_acks
+            and getattr(self.dispatcher, "_waiting_acks", None)
             and self.dispatcher.local_identity
-            and self.dispatcher.contact_book
+            and getattr(self.dispatcher, "contact_book", None)
             and len(payload) >= 2
             and payload[0] == self.dispatcher.local_identity.get_public_key()[0]
         ):
@@ -86,12 +106,53 @@ class AckHandler(BaseHandler):
                 self.log(f"Found encrypted ACK response: CRC={ack_crc:08X}")
                 return ack_crc
 
-        # Check for bundled ACKs in returned path messages
-        bundled_crc = await self._process_bundled_ack_in_path(payload)
-        if bundled_crc is not None:
-            self.log(f"Found bundled ACK: CRC={bundled_crc:08X}")
-            return bundled_crc
+        return None
 
+    async def _ack_crc_from_encrypted_path(self, packet: Packet) -> Optional[int]:
+        """Decrypt PATH wire payload and read ACK CRC from inner extra if present."""
+        d = self.dispatcher
+        if not d or not getattr(d, "local_identity", None):
+            return None
+        cb = getattr(d, "contact_book", None)
+        if not cb:
+            return None
+
+        payload = packet.payload
+        if not payload or len(payload) < 2 + 6:
+            return None
+        dest_hash = payload[0]
+        src_hash = payload[1]
+        our_hash = d.local_identity.get_public_key()[0]
+        if dest_hash != our_hash:
+            return None
+        encrypted = bytes(payload[2:])
+
+        for contact in cb.contacts:
+            pub = self._contact_pubkey_bytes(contact)
+            if not pub or pub[0] != src_hash:
+                continue
+            try:
+                peer_id = Identity(pub)
+                shared_secret = peer_id.calc_shared_secret(d.local_identity.get_private_key())
+                aes_key = shared_secret[:16]
+                decrypted = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted)
+            except Exception:
+                continue
+            if len(decrypted) < 2:
+                continue
+            path_len_byte = decrypted[0]
+            if not PathUtils.is_valid_path_len(path_len_byte):
+                continue
+            path_byte_len = PathUtils.get_path_byte_len(path_len_byte)
+            if 1 + path_byte_len > len(decrypted):
+                continue
+            extra_start = 1 + path_byte_len
+            if len(decrypted) >= extra_start + 1 + 4 and decrypted[extra_start] == PAYLOAD_TYPE_ACK:
+                return int.from_bytes(
+                    decrypted[extra_start + 1 : extra_start + 5],
+                    "little",
+                )
+            return None
         return None
 
     async def _try_decrypt_encrypted_ack(self, payload: bytes) -> Optional[int]:
@@ -105,9 +166,10 @@ class AckHandler(BaseHandler):
             if not contact:
                 return None
 
-            from ...protocol import CryptoUtils, Identity
-
-            peer_id = Identity(bytes.fromhex(contact.public_key))
+            pub = self._contact_pubkey_bytes(contact)
+            if not pub:
+                return None
+            peer_id = Identity(pub)
             shared_secret = peer_id.calc_shared_secret(
                 self.dispatcher.local_identity.get_private_key()
             )

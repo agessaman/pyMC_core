@@ -12,7 +12,7 @@ import asyncio
 import logging
 from typing import Any, Callable, Iterable, Optional
 
-from ..node.handlers import create_core_handlers
+from ..node.handlers import AckHandler, create_core_handlers
 from ..node.handlers.login_server import LoginServerHandler
 from ..protocol import LocalIdentity, Packet
 from ..protocol.constants import (
@@ -27,7 +27,6 @@ from ..protocol.constants import (
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
-from ..protocol.packet_utils import PathUtils
 from .companion_base import CompanionBase
 from .constants import (
     ADV_TYPE_CHAT,
@@ -39,113 +38,22 @@ from .constants import (
 logger = logging.getLogger("CompanionBridge")
 
 
-# ---------------------------------------------------------------------------
-# Bridge ACK handler: fires send_confirmed when ACK CRC matches a pending send
-# ---------------------------------------------------------------------------
+class _CompanionBridgeAckDispatcherShim:
+    """Minimal Dispatcher-like surface so :class:`AckHandler` can decrypt PATH ACKs."""
 
-
-class _BridgeAckHandler:
-    """Handles ACK packets (discrete and PATH-carried).
-    Fires send_confirmed when ACK CRC matches."""
+    __slots__ = ("_bridge", "_waiting_acks")
 
     def __init__(self, bridge: "CompanionBridge") -> None:
         self._bridge = bridge
+        self._waiting_acks: dict[int, object] = {}
 
-    @staticmethod
-    def payload_type() -> int:
-        return PAYLOAD_TYPE_ACK
+    @property
+    def local_identity(self) -> LocalIdentity:
+        return self._bridge._identity
 
-    async def __call__(self, packet: Packet) -> None:
-        if not packet.payload or len(packet.payload) != 4:
-            return
-        crc = int.from_bytes(packet.payload, "little")
-        await self._apply_ack(crc)
-
-    async def _apply_ack(self, crc: int) -> None:
-        """If CRC is pending, clear it and fire send_confirmed."""
-        await self._bridge._try_confirm_send(crc)
-
-    async def process_path_ack_variants(self, packet: Packet) -> Optional[int]:
-        """Decrypt PATH payload and return ACK CRC if present.
-
-        Path update and contact_path_updated are handled by ProtocolResponseHandler;
-        this only extracts ACK for send_confirmed.
-        """
-        from ..protocol import CryptoUtils, Identity
-
-        payload = packet.payload
-        if not payload or len(payload) < 2 + 6:
-            return None
-        dest_hash = payload[0]
-        src_hash = payload[1]
-        our_hash = self._bridge._identity.get_public_key()[0]
-        if dest_hash != our_hash:
-            return None
-        encrypted = bytes(payload[2:])
-        # Try each contact with matching src_hash until decryption succeeds
-        contacts_tried = 0
-        for contact in self._bridge.contacts.contacts:
-            try:
-                pk = contact.public_key
-                pub = bytes.fromhex(pk) if isinstance(pk, str) else bytes(pk)
-                if len(pub) != 32 or pub[0] != src_hash:
-                    continue
-                contacts_tried += 1
-                peer_id = Identity(pub)
-                shared_secret = peer_id.calc_shared_secret(self._bridge._identity.get_private_key())
-                aes_key = shared_secret[:16]
-                decrypted = CryptoUtils.mac_then_decrypt(aes_key, shared_secret, encrypted)
-            except Exception as e:
-                logger.debug(
-                    "process_path_ack_variants: decrypt failed for src=0x%02x " "contact=%s: %s",
-                    src_hash,
-                    getattr(contact, "name", "?"),
-                    e,
-                )
-                continue
-            if len(decrypted) < 2:
-                logger.debug(
-                    "process_path_ack_variants: decrypted too short (%d) for src=0x%02x",
-                    len(decrypted),
-                    src_hash,
-                )
-                continue
-            path_len_byte = decrypted[0]
-            if not PathUtils.is_valid_path_len(path_len_byte):
-                logger.debug(
-                    "process_path_ack_variants: invalid path_len byte 0x%02x for src=0x%02x",
-                    path_len_byte,
-                    src_hash,
-                )
-                continue
-            path_byte_len = PathUtils.get_path_byte_len(path_len_byte)
-            if 1 + path_byte_len > len(decrypted):
-                logger.debug(
-                    "process_path_ack_variants: path_byte_len=%d exceeds decrypted len=%d "
-                    "for src=0x%02x",
-                    path_byte_len,
-                    len(decrypted),
-                    src_hash,
-                )
-                continue
-            # Path update and contact_path_updated are handled by ProtocolResponseHandler
-            # If this PATH carries an ACK, return it so send_confirmed can fire
-            extra_start = 1 + path_byte_len
-            if len(decrypted) >= extra_start + 1 + 4 and decrypted[extra_start] == PAYLOAD_TYPE_ACK:
-                return int.from_bytes(decrypted[extra_start + 1 : extra_start + 5], "little")
-            return None
-        if contacts_tried > 0:
-            logger.debug(
-                "process_path_ack_variants: no contact decrypted successfully for src=0x%02x "
-                "(tried %d)",
-                src_hash,
-                contacts_tried,
-            )
-        return None
-
-    async def _notify_ack_received(self, crc: int) -> None:
-        """Called by path handler when PATH packet contained an ACK."""
-        await self._apply_ack(crc)
+    @property
+    def contact_book(self):
+        return self._bridge.contacts
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +129,13 @@ class CompanionBridge(CompanionBase):
         def _log(msg: str) -> None:
             logger.debug(f"[CompanionBridge] {msg}")
 
-        ack_handler = _BridgeAckHandler(self)
+        ack_shim = _CompanionBridgeAckDispatcherShim(self)
+        ack_handler = AckHandler(_log, dispatcher=ack_shim)
+
+        async def _on_bridge_ack_received(crc: int) -> None:
+            await self._try_confirm_send(crc)
+
+        ack_handler.set_ack_received_callback(_on_bridge_ack_received)
 
         # Use shared factory for the core protocol handlers
         core = create_core_handlers(
