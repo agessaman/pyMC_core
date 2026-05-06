@@ -15,7 +15,7 @@ from typing import Any, Iterable, Optional
 
 from ..node.node import MeshNode
 from ..protocol import LocalIdentity, Packet
-from ..protocol.constants import ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
+from ..protocol.constants import PAYLOAD_TYPE_GRP_DATA, ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
 from .companion_base import CompanionBase
 from .constants import (
     ADV_TYPE_CHAT,
@@ -274,6 +274,8 @@ class CompanionRadio(CompanionBase):
         route_type = pkt.get_route_type()
         is_flood = route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD)
         self.stats.record_rx(is_flood=is_flood)
+        if pkt.get_payload_type() == PAYLOAD_TYPE_GRP_DATA:
+            await self._handle_group_data_packet(pkt)
 
     async def _on_raw_packet_rx_log(self, pkt: Any, data: bytes, analysis: Any) -> None:
         """Dispatcher raw-packet subscriber: fire rx_log_data(snr, rssi, raw_bytes)."""

@@ -1,5 +1,7 @@
 """Tests for companion base: ResponseWaiter, adv_type_to_flags, and base API via CompanionRadio."""
 
+import hashlib
+
 import pytest
 
 from pymc_core.companion import CompanionBridge
@@ -17,8 +19,10 @@ from pymc_core.protocol.constants import (
     ADVERT_FLAG_IS_REPEATER,
     ADVERT_FLAG_IS_ROOM_SERVER,
     ADVERT_FLAG_IS_SENSOR,
+    PAYLOAD_TYPE_GRP_DATA,
     PAYLOAD_TYPE_TRACE,
     ROUTE_TYPE_DIRECT,
+    ROUTE_TYPE_TRANSPORT_FLOOD,
 )
 from pymc_core.protocol.utils import determine_contact_type_from_flags, get_contact_type_name
 
@@ -261,3 +265,53 @@ async def test_share_contact_replays_remote_pubkey_zero_hop():
     assert out.get_route_type() == ROUTE_TYPE_DIRECT
     assert out.path_len == 0
     assert len(out.path) == 0
+
+
+def test_apply_flood_scope_uses_default_scope_when_transient_unset():
+    """Persisted default scope key applies transport flooding when transient scope is unset."""
+    bridge = _make_bridge(path_hash_mode=0)
+    key = bytes(range(16))
+    assert bridge.set_default_flood_scope("region1", key) is True
+    bridge.set_flood_scope(None)
+
+    pkt = Packet()
+    pkt.header = (PAYLOAD_TYPE_TRACE << 2) | 0x01  # route type FLOOD
+    pkt.path_len = 0
+    pkt.path = bytearray()
+    pkt.payload = bytearray(b"abc")
+    pkt.payload_len = 3
+
+    bridge._apply_flood_scope(pkt)
+    assert pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+    assert pkt.transport_codes[0] != 0
+
+
+@pytest.mark.asyncio
+async def test_group_data_packet_is_queued_for_sync():
+    """Incoming GRP_DATA decrypts and queues a binary channel message."""
+    sent = []
+
+    async def _inj(pkt, wait_for_ack=False):
+        sent.append(pkt)
+        return True
+
+    bridge = CompanionBridge(LocalIdentity(), _inj, node_name="Test")
+    assert bridge.set_channel(0, "Public", b"\x11" * 32)
+
+    ch = bridge.get_channel(0)
+    plaintext = b"\x34\x12\x02\xAA\xBB"  # data_type=0x1234, len=2, payload=AABB
+    pkt = PacketBuilder.create_group_data_packet(
+        PAYLOAD_TYPE_GRP_DATA,
+        channel_hash=hashlib.sha256(ch.secret).digest()[0],
+        channel_secret=ch.secret,
+        plaintext=plaintext,
+        secret=ch.secret,
+    )
+
+    await bridge.process_received_packet(pkt)
+    queued = bridge.sync_next_message()
+    assert queued is not None
+    assert queued.is_channel is True
+    assert queued.channel_idx == 0
+    assert queued.channel_data_type == 0x1234
+    assert queued.channel_data_payload == b"\xAA\xBB"

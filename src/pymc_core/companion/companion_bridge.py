@@ -19,6 +19,7 @@ from ..protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_ANON_REQ,
+    PAYLOAD_TYPE_GRP_DATA,
     PAYLOAD_TYPE_GRP_TXT,
     PAYLOAD_TYPE_PATH,
     PAYLOAD_TYPE_RAW_CUSTOM,
@@ -304,6 +305,11 @@ class CompanionBridge(CompanionBase):
                 await handler(packet)
             except Exception as e:
                 logger.error(f"Handler error for type {ptype:02X}: {e}")
+        elif ptype == PAYLOAD_TYPE_GRP_DATA:
+            try:
+                await self._handle_group_data_packet(packet)
+            except Exception as e:
+                logger.error(f"Group data handler error: {e}")
 
         # NOTE: PATH packets are already delivered to protocol_response_handler
         # via PathHandler.__call__ (path.py), which runs as the handler above.
