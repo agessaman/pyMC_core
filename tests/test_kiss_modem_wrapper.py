@@ -7,6 +7,7 @@ and LoRaRadio interface implementation.
 
 import struct
 import threading
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -828,6 +829,279 @@ class TestSendFrame:
         assert frame[0] == KISS_FEND
         assert frame[1] == CMD_DATA
         assert frame[-1] == KISS_FEND
+
+
+class TestSerialWriteSerialization:
+    """Test UART write serialization across concurrent callers."""
+
+    def test_write_frame_serializes_data_and_sethardware_callers(self):
+        """Data TX and SetHardware writes must not interleave at the UART layer."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+
+        class BlockingSerial:
+            def __init__(self):
+                self.is_open = True
+                self._active = 0
+                self.max_active = 0
+                self._state_lock = threading.Lock()
+                self.first_write_entered = threading.Event()
+                self.release_first_write = threading.Event()
+                self.first_seen = False
+                self.writes = []
+                self.flush_count = 0
+
+            def write(self, data):
+                with self._state_lock:
+                    self._active += 1
+                    self.max_active = max(self.max_active, self._active)
+
+                if not self.first_seen:
+                    self.first_seen = True
+                    self.first_write_entered.set()
+                    self.release_first_write.wait(timeout=1.0)
+
+                self.writes.append(bytes(data))
+
+                with self._state_lock:
+                    self._active -= 1
+                return len(data)
+
+            def flush(self):
+                self.flush_count += 1
+
+        serial_conn = BlockingSerial()
+        modem.serial_conn = serial_conn
+        modem.is_connected = True
+
+        data_frame = modem._encode_kiss_frame(CMD_DATA, b"\x01\x02\x03")
+        sethw_frame = modem._encode_kiss_frame(KISS_CMD_SETHARDWARE, bytes([CMD_PING]))
+
+        results: dict[str, bool] = {}
+        second_started = threading.Event()
+        second_done = threading.Event()
+
+        def write_data():
+            results["data"] = modem._write_frame(data_frame)
+
+        def write_sethw():
+            second_started.set()
+            results["sethw"] = modem._write_frame(sethw_frame)
+            second_done.set()
+
+        t1 = threading.Thread(target=write_data)
+        t1.start()
+        assert serial_conn.first_write_entered.wait(timeout=1.0)
+
+        t2 = threading.Thread(target=write_sethw)
+        t2.start()
+        assert second_started.wait(timeout=1.0)
+
+        # While the first writer is blocked inside serial.write, a second caller
+        # should not enter serial.write concurrently.
+        assert not second_done.wait(timeout=0.05)
+        assert serial_conn.max_active == 1
+
+        serial_conn.release_first_write.set()
+
+        t1.join(timeout=1.0)
+        t2.join(timeout=1.0)
+
+        assert results.get("data") is True
+        assert results.get("sethw") is True
+        assert serial_conn.max_active == 1
+        assert serial_conn.flush_count == 2
+        assert serial_conn.writes == [data_frame, sethw_frame]
+
+    def test_ping_and_noise_floor_under_concurrent_data_load(self):
+        """Concurrent data TX should not cause ping/noise-floor command timeouts."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        class RespondingSerial:
+            def __init__(self):
+                self.is_open = True
+                self._modem: KissModemWrapper | None = None
+                self.flush_count = 0
+
+            def set_modem(self, m: KissModemWrapper) -> None:
+                self._modem = m
+
+            def write(self, data):
+                frame = bytes(data)
+                if (
+                    self._modem is not None
+                    and len(frame) >= 4
+                    and frame[0] == KISS_FEND
+                    and frame[-1] == KISS_FEND
+                    and frame[1] == KISS_CMD_SETHARDWARE
+                ):
+                    sub_cmd = frame[2]
+                    if sub_cmd == CMD_PING:
+                        response_sub = RESP_PONG
+                        response_payload = b""
+                    elif sub_cmd == CMD_GET_NOISE_FLOOR:
+                        response_sub = RESP_NOISE_FLOOR
+                        response_payload = struct.pack("<h", -95)
+                    else:
+                        response_sub = None
+                        response_payload = b""
+
+                    if response_sub is not None:
+
+                        def emit() -> None:
+                            resp = (
+                                bytes([KISS_FEND, KISS_CMD_SETHARDWARE, response_sub])
+                                + response_payload
+                                + bytes([KISS_FEND])
+                            )
+                            for b in resp:
+                                self._modem._decode_kiss_byte(b)
+
+                        threading.Thread(target=emit, daemon=True).start()
+                return len(frame)
+
+            def flush(self):
+                self.flush_count += 1
+
+        serial_conn = RespondingSerial()
+        serial_conn.set_modem(modem)
+        modem.serial_conn = serial_conn
+
+        stop_event = threading.Event()
+        data_frame = modem._encode_kiss_frame(CMD_DATA, b"\xAA\xBB\xCC")
+
+        def data_tx_worker() -> None:
+            for _ in range(200):
+                if stop_event.is_set():
+                    return
+                modem._write_frame(data_frame)
+
+        tx_thread = threading.Thread(target=data_tx_worker)
+        tx_thread.start()
+
+        try:
+            for _ in range(40):
+                ping_resp = modem._send_command(CMD_PING, timeout=0.2)
+                assert ping_resp is not None
+                assert ping_resp[0] == RESP_PONG
+
+                noise = modem.get_noise_floor(timeout=0.2)
+                assert noise == -95
+        finally:
+            stop_event.set()
+            tx_thread.join(timeout=1.0)
+
+    def test_tx_worker_and_sethardware_queries_make_progress_together(self):
+        """Queued data TX should still make progress while periodic SetHardware queries run."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        class RespondingSerial:
+            def __init__(self):
+                self.is_open = True
+                self._modem: KissModemWrapper | None = None
+                self.flush_count = 0
+                self.data_writes = 0
+
+            def set_modem(self, m: KissModemWrapper) -> None:
+                self._modem = m
+
+            def write(self, data):
+                frame = bytes(data)
+                if (
+                    self._modem is not None
+                    and len(frame) >= 4
+                    and frame[0] == KISS_FEND
+                    and frame[-1] == KISS_FEND
+                    and frame[1] == KISS_CMD_SETHARDWARE
+                ):
+                    sub_cmd = frame[2]
+                    if sub_cmd == CMD_PING:
+                        response_sub = RESP_PONG
+                        response_payload = b""
+                    elif sub_cmd == CMD_GET_NOISE_FLOOR:
+                        response_sub = RESP_NOISE_FLOOR
+                        response_payload = struct.pack("<h", -92)
+                    else:
+                        response_sub = None
+                        response_payload = b""
+
+                    if response_sub is not None:
+
+                        def emit() -> None:
+                            resp = (
+                                bytes([KISS_FEND, KISS_CMD_SETHARDWARE, response_sub])
+                                + response_payload
+                                + bytes([KISS_FEND])
+                            )
+                            for b in resp:
+                                self._modem._decode_kiss_byte(b)
+
+                        threading.Thread(target=emit, daemon=True).start()
+                elif len(frame) >= 2 and frame[0] == KISS_FEND and frame[1] == CMD_DATA:
+                    self.data_writes += 1
+
+                return len(frame)
+
+            def flush(self):
+                self.flush_count += 1
+
+        serial_conn = RespondingSerial()
+        serial_conn.set_modem(modem)
+        modem.serial_conn = serial_conn
+
+        for _ in range(120):
+            assert modem.send_frame(b"\x01\x02\x03")
+
+        modem.stop_event.clear()
+        tx_thread = threading.Thread(target=modem._tx_worker, daemon=True)
+        tx_thread.start()
+
+        try:
+            for _ in range(25):
+                ping_resp = modem._send_command(CMD_PING, timeout=0.3)
+                assert ping_resp is not None
+                assert ping_resp[0] == RESP_PONG
+
+                noise = modem.get_noise_floor(timeout=0.3)
+                assert noise == -92
+
+            deadline = time.time() + 2.0
+            while modem.tx_buffer and time.time() < deadline:
+                time.sleep(0.01)
+            assert len(modem.tx_buffer) == 0
+            assert serial_conn.data_writes > 0
+        finally:
+            modem.stop_event.set()
+            tx_thread.join(timeout=1.0)
+
+    def test_write_error_does_not_poison_future_writes(self):
+        """A serial write error should fail fast and allow subsequent writes to proceed."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        class FlakySerial:
+            def __init__(self):
+                self.is_open = True
+                self.calls = 0
+                self.flush_count = 0
+
+            def write(self, data):
+                self.calls += 1
+                if self.calls == 1:
+                    raise OSError("simulated serial failure")
+                return len(data)
+
+            def flush(self):
+                self.flush_count += 1
+
+        serial_conn = FlakySerial()
+        modem.serial_conn = serial_conn
+
+        frame = modem._encode_kiss_frame(CMD_DATA, b"\xAA\xBB")
+        assert modem._write_frame(frame) is False
+        assert modem._write_frame(frame) is True
+        assert serial_conn.flush_count == 1
 
 
 class TestQueryMethods:

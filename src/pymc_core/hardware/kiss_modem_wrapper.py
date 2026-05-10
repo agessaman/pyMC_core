@@ -306,6 +306,9 @@ class KissModemWrapper(LoRaRadio):
         # Response handling
         # Single-flight SetHardware command execution (send -> wait -> return)
         self._command_lock = threading.Lock()
+        # Serialize all UART writes so frame bytes from different callers/threads
+        # (TX worker vs SetHardware/control paths) cannot interleave.
+        self._serial_write_lock = threading.Lock()
         self._response_event = threading.Event()
         self._pending_response: Optional[tuple[int, bytes]] = None
         self._response_lock = threading.Lock()
@@ -453,29 +456,32 @@ class KissModemWrapper(LoRaRadio):
 
         Ensures the entire frame (including trailing FEND) is written; retries
         on partial write so we never send a truncated frame.
+        This method is atomic across threads so frame bytes cannot interleave
+        on the UART when multiple callers write concurrently.
 
         Returns:
             True if all bytes written, False on error or incomplete write.
         """
-        if not self.serial_conn or not self.serial_conn.is_open:
-            return False
-        offset = 0
-        while offset < len(frame):
-            try:
-                n = self.serial_conn.write(frame[offset:])
-                if n is None or n <= 0:
-                    logger.error("Serial write returned %s", n)
-                    return False
-                offset += n
-            except Exception as e:
-                logger.error("Serial write error: %s", e)
+        with self._serial_write_lock:
+            if not self.serial_conn or not self.serial_conn.is_open:
                 return False
-        try:
-            self.serial_conn.flush()
-        except Exception as e:
-            logger.error("Serial flush error: %s", e)
-            return False
-        return True
+            offset = 0
+            while offset < len(frame):
+                try:
+                    n = self.serial_conn.write(frame[offset:])
+                    if n is None or n <= 0:
+                        logger.error("Serial write returned %s", n)
+                        return False
+                    offset += n
+                except Exception as e:
+                    logger.error("Serial write error: %s", e)
+                    return False
+            try:
+                self.serial_conn.flush()
+            except Exception as e:
+                logger.error("Serial flush error: %s", e)
+                return False
+            return True
 
     def _set_kiss_tx_delay(self, delay_ms: int) -> None:
         """
