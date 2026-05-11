@@ -40,6 +40,8 @@ PAYLOAD_TYPE_RAW_CUSTOM = 0x0F
 # ---------------------------------------------------------------------------
 PAYLOAD_VER_1 = 0x00  # Currently supported
 PAYLOAD_VER_2 = 0x01  # Reserved for future use
+PAYLOAD_VER_3 = 0x02  # Reserved for future use
+PAYLOAD_VER_4 = 0x03  # Reserved for future use
 MAX_SUPPORTED_PAYLOAD_VERSION = PAYLOAD_VER_2  # Accept versions 0-1
 
 # ---------------------------------------------------------------------------
