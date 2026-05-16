@@ -14,6 +14,7 @@ import logging
 import random
 import struct
 import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, Optional, Union
@@ -283,6 +284,8 @@ class KissModemWrapper(LoRaRadio):
 
         self.serial_conn: Optional[serial.Serial] = None
         self.is_connected = False
+        self._degraded = False
+        self._degraded_reason: Optional[str] = None
 
         self.rx_buffer = deque(maxlen=RX_BUFFER_SIZE)
         self.tx_buffer = deque(maxlen=TX_BUFFER_SIZE)
@@ -293,7 +296,22 @@ class KissModemWrapper(LoRaRadio):
 
         self.rx_thread: Optional[threading.Thread] = None
         self.tx_thread: Optional[threading.Thread] = None
+        self.reconnect_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
+        self._reconnecting_event = threading.Event()
+        self._connection_lock = threading.RLock()
+        self._failure_log_lock = threading.Lock()
+        self._last_failure_log_ts = 0.0
+        self._failure_log_interval_s = float(
+            self.radio_config.get("failure_log_interval_seconds", 10.0)
+        )
+        self._reconnect_base_delay_s = float(
+            self.radio_config.get("reconnect_base_delay_seconds", 0.5)
+        )
+        self._reconnect_max_delay_s = float(
+            self.radio_config.get("reconnect_max_delay_seconds", 15.0)
+        )
+        self._reconnect_max_attempts = int(self.radio_config.get("reconnect_max_attempts", 0))
 
         # Callbacks
         self.on_frame_received = on_frame_received
@@ -378,6 +396,40 @@ class KissModemWrapper(LoRaRadio):
         Returns:
             True if connection successful, False otherwise
         """
+        with self._connection_lock:
+            self.stop_event.clear()
+            if not self._open_serial_and_start_threads():
+                return False
+            if not self._run_post_connect_handshake():
+                self._close_serial_connection()
+                self.is_connected = False
+                return False
+            self._reconnecting_event.clear()
+            self._degraded = False
+            self._degraded_reason = None
+            return True
+
+    def disconnect(self):
+        """Disconnect from serial port and stop threads"""
+        with self._connection_lock:
+            self.stop_event.set()
+            self.is_connected = False
+            self._degraded = False
+            self._degraded_reason = None
+            self._reconnecting_event.clear()
+            self._close_serial_connection()
+
+        self._stop_io_threads(join_timeout=2.0)
+        self._stop_reconnect_thread(join_timeout=2.0)
+
+        if self._callback_executor is not None:
+            self._callback_executor.shutdown(wait=False)
+            self._callback_executor = None
+
+        logger.info(f"KISS modem disconnected from {self.port}")
+
+    def _open_serial_and_start_threads(self) -> bool:
+        """Open serial device and start RX/TX workers."""
         try:
             self.serial_conn = serial.Serial(
                 port=self.port,
@@ -387,68 +439,70 @@ class KissModemWrapper(LoRaRadio):
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
             )
-
             self.is_connected = True
-            self.stop_event.clear()
 
-            # Start communication threads
             self.rx_thread = threading.Thread(target=self._rx_worker, daemon=True)
             self.tx_thread = threading.Thread(target=self._tx_worker, daemon=True)
-
             self.rx_thread.start()
             self.tx_thread.start()
-
-            logger.info(f"KISS modem connected to {self.port} at {self.baudrate} baud")
-
-            # Auto-configure if requested
-            if self.auto_configure and self.radio_config:
-                if not self.configure_radio():
-                    logger.warning("Auto-configuration failed")
-                    return False
-
-            # Query modem info
-            self._query_modem_info()
-
-            # Set KISS TXDELAY so key-up delay is not the firmware default 500ms (reduces
-            # round-trip latency for repeaters). Value in 10ms units; default 50ms.
-            tx_delay_ms = self.radio_config.get("tx_delay_ms", 50)
-            self._set_kiss_tx_delay(tx_delay_ms)
-            if "kiss_persistence" in self.radio_config:
-                self.set_kiss_persistence(self.radio_config["kiss_persistence"])
-            if "kiss_slottime_ms" in self.radio_config:
-                self.set_kiss_slottime(self.radio_config["kiss_slottime_ms"])
-            if "kiss_txtail_ms" in self.radio_config:
-                self.set_kiss_txtail(self.radio_config["kiss_txtail_ms"])
-            if "kiss_full_duplex" in self.radio_config:
-                self.set_kiss_full_duplex(bool(self.radio_config["kiss_full_duplex"]))
-
+            logger.info("KISS modem connected to %s at %s baud", self.port, self.baudrate)
             return True
-
         except Exception as e:
-            logger.error(f"Failed to connect to {self.port}: {e}")
+            logger.error("Failed to connect to %s: %s", self.port, e)
             self.is_connected = False
             return False
 
-    def disconnect(self):
-        """Disconnect from serial port and stop threads"""
-        self.is_connected = False
-        self.stop_event.set()
+    def _run_post_connect_handshake(self) -> bool:
+        """Run modem setup steps after serial open."""
+        # Auto-configure if requested
+        if self.auto_configure and self.radio_config:
+            if not self.configure_radio():
+                logger.warning("Auto-configuration failed")
+                return False
 
-        # Wait for threads to finish
-        if self.rx_thread and self.rx_thread.is_alive():
-            self.rx_thread.join(timeout=2.0)
-        if self.tx_thread and self.tx_thread.is_alive():
-            self.tx_thread.join(timeout=2.0)
+        # Query modem info
+        self._query_modem_info()
 
-        if self._callback_executor is not None:
-            self._callback_executor.shutdown(wait=False)
-            self._callback_executor = None
+        # Set KISS TXDELAY so key-up delay is not the firmware default 500ms.
+        tx_delay_ms = self.radio_config.get("tx_delay_ms", 50)
+        self._set_kiss_tx_delay(tx_delay_ms)
+        if "kiss_persistence" in self.radio_config:
+            self.set_kiss_persistence(self.radio_config["kiss_persistence"])
+        if "kiss_slottime_ms" in self.radio_config:
+            self.set_kiss_slottime(self.radio_config["kiss_slottime_ms"])
+        if "kiss_txtail_ms" in self.radio_config:
+            self.set_kiss_txtail(self.radio_config["kiss_txtail_ms"])
+        if "kiss_full_duplex" in self.radio_config:
+            self.set_kiss_full_duplex(bool(self.radio_config["kiss_full_duplex"]))
+        return True
 
-        # Close serial connection
-        if self.serial_conn and self.serial_conn.is_open:
-            self.serial_conn.close()
+    def _close_serial_connection(self) -> None:
+        """Close serial handle without waiting for worker threads."""
+        conn = self.serial_conn
+        self.serial_conn = None
+        if conn and conn.is_open:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
-        logger.info(f"KISS modem disconnected from {self.port}")
+    def _stop_io_threads(self, join_timeout: float = 2.0) -> None:
+        """Join RX/TX threads, skipping current thread to avoid deadlock."""
+        current = threading.current_thread()
+        if self.rx_thread and self.rx_thread.is_alive() and self.rx_thread is not current:
+            self.rx_thread.join(timeout=join_timeout)
+        if self.tx_thread and self.tx_thread.is_alive() and self.tx_thread is not current:
+            self.tx_thread.join(timeout=join_timeout)
+
+    def _stop_reconnect_thread(self, join_timeout: float = 2.0) -> None:
+        """Join reconnect thread if it is running."""
+        current = threading.current_thread()
+        if (
+            self.reconnect_thread
+            and self.reconnect_thread.is_alive()
+            and self.reconnect_thread is not current
+        ):
+            self.reconnect_thread.join(timeout=join_timeout)
 
     def _write_frame(self, frame: bytes) -> bool:
         """
@@ -464,6 +518,7 @@ class KissModemWrapper(LoRaRadio):
         """
         with self._serial_write_lock:
             if not self.serial_conn or not self.serial_conn.is_open:
+                self._mark_serial_failure("Serial connection closed during write")
                 return False
             offset = 0
             while offset < len(frame):
@@ -471,17 +526,87 @@ class KissModemWrapper(LoRaRadio):
                     n = self.serial_conn.write(frame[offset:])
                     if n is None or n <= 0:
                         logger.error("Serial write returned %s", n)
+                        self._mark_serial_failure(f"Serial write returned {n}")
                         return False
                     offset += n
                 except Exception as e:
                     logger.error("Serial write error: %s", e)
+                    self._mark_serial_failure(f"Serial write failed: {e}")
                     return False
             try:
                 self.serial_conn.flush()
             except Exception as e:
                 logger.error("Serial flush error: %s", e)
+                self._mark_serial_failure(f"Serial flush failed: {e}")
                 return False
             return True
+
+    def _mark_serial_failure(self, reason: str) -> None:
+        """Transition to degraded mode and trigger reconnect loop once."""
+        if self.stop_event.is_set():
+            return
+
+        now = time.time()
+        with self._failure_log_lock:
+            should_log = (now - self._last_failure_log_ts) >= self._failure_log_interval_s
+            if should_log:
+                self._last_failure_log_ts = now
+                logger.warning("Marking KISS serial link degraded: %s", reason)
+
+        with self._connection_lock:
+            self._degraded = True
+            self._degraded_reason = reason
+            self.is_connected = False
+            self._close_serial_connection()
+
+        self._start_reconnect_worker()
+
+    def _start_reconnect_worker(self) -> None:
+        """Start reconnect thread once."""
+        if self.stop_event.is_set() or self._reconnecting_event.is_set():
+            return
+        self._reconnecting_event.set()
+        self.reconnect_thread = threading.Thread(target=self._reconnect_worker, daemon=True)
+        self.reconnect_thread.start()
+
+    def _reconnect_worker(self) -> None:
+        """Reconnect with exponential backoff and re-run modem handshake."""
+        attempts = 0
+        while not self.stop_event.is_set():
+            attempts += 1
+            if self._reconnect_max_attempts > 0 and attempts > self._reconnect_max_attempts:
+                logger.error(
+                    "KISS modem reconnect exhausted after %s attempts (last reason: %s)",
+                    self._reconnect_max_attempts,
+                    self._degraded_reason or "unknown",
+                )
+                break
+
+            delay = min(
+                self._reconnect_base_delay_s * (2 ** max(0, attempts - 1)),
+                self._reconnect_max_delay_s,
+            )
+            jitter = random.uniform(0.0, min(0.25, delay * 0.2))
+            if attempts > 1:
+                time.sleep(delay + jitter)
+
+            with self._connection_lock:
+                if self.stop_event.is_set():
+                    break
+                self._stop_io_threads(join_timeout=0.5)
+                if not self._open_serial_and_start_threads():
+                    continue
+                if not self._run_post_connect_handshake():
+                    self._close_serial_connection()
+                    self.is_connected = False
+                    continue
+                self._degraded = False
+                self._degraded_reason = None
+                logger.info("KISS modem serial reconnect successful on attempt %s", attempts)
+                self._reconnecting_event.clear()
+                return
+
+        self._reconnecting_event.clear()
 
     def _set_kiss_tx_delay(self, delay_ms: int) -> None:
         """
@@ -756,6 +881,13 @@ class KissModemWrapper(LoRaRadio):
         """
         # Ensure SetHardware requests are single-flight. This prevents concurrent
         # callers from clearing the shared waiter state or stealing responses.
+        in_reconnect_thread = threading.current_thread() is self.reconnect_thread
+        reconnecting_from_non_reconnect_thread = (
+            self._reconnecting_event.is_set() and not in_reconnect_thread
+        )
+        degraded_from_non_reconnect_thread = self._degraded and not in_reconnect_thread
+        if reconnecting_from_non_reconnect_thread or degraded_from_non_reconnect_thread:
+            return None
         with self._command_lock:
             expected = sub_cmd | 0x80
             acceptable: set[int] = {expected, HW_RESP_ERROR}
@@ -1184,9 +1316,13 @@ class KissModemWrapper(LoRaRadio):
         if not self.is_connected:
             return False
         try:
-            return self.ping()
+            healthy = self.ping()
+            if not healthy:
+                self._mark_serial_failure("Health check ping failed")
+            return healthy
         except Exception as e:
             logger.debug(f"KISS modem health check failed: {e}")
+            self._mark_serial_failure(f"Health check exception: {e}")
             return False
 
     # Optional host-side LBT (only when lbt_enabled, e.g. full-duplex on half-duplex link)
@@ -1616,6 +1752,7 @@ class KissModemWrapper(LoRaRadio):
             except Exception as e:
                 if self.is_connected:
                     logger.error(f"RX worker error: {e}")
+                    self._mark_serial_failure(f"RX worker error: {e}")
                 break
 
     def _tx_worker(self):
@@ -1633,12 +1770,14 @@ class KissModemWrapper(LoRaRadio):
                             logger.warning("TX frame write failed, dropping frame")
                     else:
                         logger.warning("Serial connection not open")
+                        self._mark_serial_failure("Serial connection not open in TX worker")
                 else:
                     threading.Event().wait(0.01)
 
             except Exception as e:
                 if self.is_connected:
                     logger.error(f"TX worker error: {e}")
+                    self._mark_serial_failure(f"TX worker error: {e}")
                 break
 
     def __enter__(self):

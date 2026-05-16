@@ -1076,7 +1076,7 @@ class TestSerialWriteSerialization:
             tx_thread.join(timeout=1.0)
 
     def test_write_error_does_not_poison_future_writes(self):
-        """A serial write error should fail fast and allow subsequent writes to proceed."""
+        """A serial write error should fail fast and transition to degraded mode."""
         modem = KissModemWrapper(port="/dev/null", auto_configure=False)
         modem.is_connected = True
 
@@ -1097,11 +1097,13 @@ class TestSerialWriteSerialization:
 
         serial_conn = FlakySerial()
         modem.serial_conn = serial_conn
+        modem._start_reconnect_worker = MagicMock()
 
         frame = modem._encode_kiss_frame(CMD_DATA, b"\xAA\xBB")
         assert modem._write_frame(frame) is False
-        assert modem._write_frame(frame) is True
-        assert serial_conn.flush_count == 1
+        assert modem._degraded is True
+        assert modem.is_connected is False
+        modem._start_reconnect_worker.assert_called_once()
 
 
 class TestQueryMethods:
@@ -1582,3 +1584,89 @@ class TestContextManager:
                 mock_connect.assert_called_once()
                 mock_disconnect.assert_called_once()
                 _ = modem  # hold ref so __del__ runs after assert, not before
+
+
+class TestSerialRecovery:
+    """Test serial degraded-state and reconnect behavior."""
+
+    def test_write_frame_marks_degraded_and_triggers_reconnect(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        class _FailingSerial:
+            is_open = True
+
+            def write(self, _data):
+                raise OSError(5, "Input/output error")
+
+        modem.serial_conn = _FailingSerial()
+        modem._start_reconnect_worker = MagicMock()
+
+        frame = modem._encode_kiss_frame(CMD_DATA, b"\x01\x02")
+        assert modem._write_frame(frame) is False
+        assert modem._degraded is True
+        assert modem.is_connected is False
+        assert modem.serial_conn is None
+        modem._start_reconnect_worker.assert_called_once()
+
+    def test_send_command_fails_fast_while_reconnecting(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem._reconnecting_event.set()
+        modem._write_frame = MagicMock(return_value=True)
+
+        assert modem._send_command(CMD_PING, timeout=0.1) is None
+        modem._write_frame.assert_not_called()
+
+    def test_send_command_allowed_from_reconnect_thread_during_reconnect(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem._reconnecting_event.set()
+        modem.reconnect_thread = threading.current_thread()
+        modem._response_queue.append((RESP_PONG, b""))
+
+        assert modem._send_command(CMD_PING, timeout=0.1) == (RESP_PONG, b"")
+
+    def test_send_command_allowed_from_reconnect_thread_while_degraded(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem._degraded = True
+        modem.reconnect_thread = threading.current_thread()
+        modem._response_queue.append((RESP_PONG, b""))
+
+        assert modem._send_command(CMD_PING, timeout=0.1) == (RESP_PONG, b"")
+
+    def test_reconnect_worker_recovers_after_open_failure(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._reconnecting_event.set()
+        modem._degraded = True
+        modem._degraded_reason = "test failure"
+        modem._reconnect_base_delay_s = 0.0
+        modem._reconnect_max_delay_s = 0.0
+
+        modem._open_serial_and_start_threads = MagicMock(side_effect=[False, True])
+        modem._run_post_connect_handshake = MagicMock(return_value=True)
+        modem._stop_io_threads = MagicMock()
+
+        with patch("pymc_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None):
+            modem._reconnect_worker()
+
+        assert modem._open_serial_and_start_threads.call_count == 2
+        assert modem._run_post_connect_handshake.call_count == 1
+        assert modem._degraded is False
+        assert modem._reconnecting_event.is_set() is False
+
+    def test_start_reconnect_worker_guard_prevents_duplicate_thread(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._reconnecting_event.set()
+        modem._start_reconnect_worker()
+        assert modem.reconnect_thread is None
+
+    def test_connect_clears_reconnecting_gate_after_success(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._reconnecting_event.set()
+        modem._open_serial_and_start_threads = MagicMock(return_value=True)
+        modem._run_post_connect_handshake = MagicMock(return_value=True)
+
+        assert modem.connect() is True
+        assert modem._reconnecting_event.is_set() is False
