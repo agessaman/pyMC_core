@@ -1700,6 +1700,83 @@ class TestSerialRecovery:
         assert modem.is_connected is False
         modem._close_serial_connection.assert_called_once()
 
+    def test_connect_retries_transient_configure_failure_then_succeeds(self):
+        modem = KissModemWrapper(
+            port="/dev/null",
+            auto_configure=True,
+            radio_config={"frequency": 869618000},
+        )
+        modem._open_serial_and_start_threads = MagicMock(return_value=True)
+        modem._close_serial_connection = MagicMock()
+        modem._query_modem_info = MagicMock()
+        modem._set_kiss_tx_delay = MagicMock()
+
+        connected_states = []
+
+        def transient_configure_failure() -> bool:
+            connected_states.append(modem.is_connected)
+            return len(connected_states) > 1
+
+        modem.configure_radio = MagicMock(side_effect=transient_configure_failure)
+
+        with patch(
+            "pymc_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None
+        ) as sleep_mock:
+            assert modem.connect() is True
+
+        assert modem.configure_radio.call_count == 2
+        assert connected_states == [False, False]
+        assert modem.is_connected is True
+        assert modem._close_serial_connection.call_count == 0
+        assert len(sleep_mock.call_args_list) == 2  # settle + one retry backoff
+
+    def test_connect_persistent_configure_failures_still_fail(self):
+        modem = KissModemWrapper(
+            port="/dev/null",
+            auto_configure=True,
+            radio_config={"frequency": 869618000},
+        )
+        modem._open_serial_and_start_threads = MagicMock(return_value=True)
+        modem._close_serial_connection = MagicMock()
+        modem._query_modem_info = MagicMock()
+        modem._set_kiss_tx_delay = MagicMock()
+        modem.configure_radio = MagicMock(return_value=False)
+
+        with patch(
+            "pymc_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None
+        ) as sleep_mock:
+            assert modem.connect() is False
+
+        assert modem.is_connected is False
+        assert modem.configure_radio.call_count == (1 + modem._post_connect_configure_retries)
+        assert len(sleep_mock.call_args_list) == (1 + modem._post_connect_configure_retries)
+        modem._close_serial_connection.assert_called_once()
+
+    def test_connect_sets_connected_only_after_retrying_handshake(self):
+        modem = KissModemWrapper(
+            port="/dev/null",
+            auto_configure=True,
+            radio_config={"frequency": 869618000},
+        )
+        modem._open_serial_and_start_threads = MagicMock(return_value=True)
+        modem._close_serial_connection = MagicMock()
+        modem._query_modem_info = MagicMock()
+        modem._set_kiss_tx_delay = MagicMock()
+
+        observed_states = []
+
+        def configure_with_one_retry() -> bool:
+            observed_states.append(modem.is_connected)
+            return len(observed_states) >= 2
+
+        modem.configure_radio = MagicMock(side_effect=configure_with_one_retry)
+
+        with patch("pymc_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None):
+            assert modem.connect() is True
+
+        assert observed_states == [False, False]
+        assert modem.is_connected is True
+
     def test_reconnect_sets_connected_only_after_handshake_success(self):
         modem = KissModemWrapper(port="/dev/null", auto_configure=False)
         modem._reconnecting_event.set()

@@ -193,6 +193,9 @@ TX_BUFFER_SIZE = 1024
 DEFAULT_BAUDRATE = 115200
 DEFAULT_TIMEOUT = 1.0
 RESPONSE_TIMEOUT = 5.0  # Timeout for command responses
+POST_CONNECT_SETTLE_SECONDS = 0.75
+POST_CONNECT_CONFIGURE_RETRIES = 2
+POST_CONNECT_CONFIGURE_RETRY_BACKOFF_SECONDS = 0.25
 
 logger = logging.getLogger("KissModemWrapper")
 
@@ -312,6 +315,33 @@ class KissModemWrapper(LoRaRadio):
             self.radio_config.get("reconnect_max_delay_seconds", 15.0)
         )
         self._reconnect_max_attempts = int(self.radio_config.get("reconnect_max_attempts", 0))
+        self._post_connect_settle_s = max(
+            0.0,
+            float(
+                self.radio_config.get(
+                    "post_connect_settle_seconds",
+                    POST_CONNECT_SETTLE_SECONDS,
+                )
+            ),
+        )
+        self._post_connect_configure_retries = max(
+            0,
+            int(
+                self.radio_config.get(
+                    "post_connect_configure_retries",
+                    POST_CONNECT_CONFIGURE_RETRIES,
+                )
+            ),
+        )
+        self._post_connect_configure_retry_backoff_s = max(
+            0.0,
+            float(
+                self.radio_config.get(
+                    "post_connect_configure_retry_backoff_seconds",
+                    POST_CONNECT_CONFIGURE_RETRY_BACKOFF_SECONDS,
+                )
+            ),
+        )
 
         # Callbacks
         self.on_frame_received = on_frame_received
@@ -456,11 +486,33 @@ class KissModemWrapper(LoRaRadio):
 
     def _run_post_connect_handshake(self) -> bool:
         """Run modem setup steps after serial open."""
+        if self._post_connect_settle_s > 0:
+            logger.debug(
+                "Post-connect settle delay %.2fs before SetHardware handshake",
+                self._post_connect_settle_s,
+            )
+            time.sleep(self._post_connect_settle_s)
+
         # Auto-configure if requested
         if self.auto_configure and self.radio_config:
-            if not self.configure_radio():
-                logger.warning("Auto-configuration failed")
-                return False
+            total_attempts = 1 + self._post_connect_configure_retries
+            for attempt in range(1, total_attempts + 1):
+                if self.configure_radio():
+                    break
+
+                if attempt >= total_attempts:
+                    logger.warning("Auto-configuration failed after %s attempts", total_attempts)
+                    return False
+
+                retry_delay = self._post_connect_configure_retry_backoff_s * attempt
+                logger.warning(
+                    "Auto-configuration attempt %s/%s failed; retrying in %.2fs",
+                    attempt,
+                    total_attempts,
+                    retry_delay,
+                )
+                if retry_delay > 0:
+                    time.sleep(retry_delay)
 
         # Query modem info
         self._query_modem_info()
