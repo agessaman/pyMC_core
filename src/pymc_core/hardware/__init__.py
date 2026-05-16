@@ -40,6 +40,24 @@ except ImportError:
     _KISS_MODEM_AVAILABLE = False
     KissModemWrapper = None
 
+# Conditional import for USBLoRaRadio (requires pyserial)
+try:
+    from .usb_radio import USBLoRaRadio
+
+    _USB_AVAILABLE = True
+except ImportError:
+    _USB_AVAILABLE = False
+    USBLoRaRadio = None
+
+# Conditional import for TCPLoRaRadio (stdlib only — socket/threading/asyncio)
+try:
+    from .tcp_radio import TCPLoRaRadio
+
+    _TCP_AVAILABLE = True
+except ImportError:
+    _TCP_AVAILABLE = False
+    TCPLoRaRadio = None
+
 __all__ = ["LoRaRadio"]
 
 # Add WsRadio to exports if available
@@ -57,3 +75,11 @@ if _KISS_SERIAL_AVAILABLE:
 # Add KissModemWrapper to exports if available
 if _KISS_MODEM_AVAILABLE:
     __all__.append("KissModemWrapper")
+
+# Add USBLoRaRadio to exports if available
+if _USB_AVAILABLE:
+    __all__.append("USBLoRaRadio")
+
+# Add TCPLoRaRadio to exports if available
+if _TCP_AVAILABLE:
+    __all__.append("TCPLoRaRadio")

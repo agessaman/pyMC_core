@@ -8,16 +8,20 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from pymc_core.companion.constants import (
+    ERR_CODE_ILLEGAL_ARG,
+    ERR_CODE_NOT_FOUND,
     ERR_CODE_TABLE_FULL,
     ERR_CODE_UNSUPPORTED_CMD,
     MAX_PATH_SIZE,
     PUB_KEY_SIZE,
     PUSH_CODE_ADVERT,
     PUSH_CODE_NEW_ADVERT,
+    RESP_CODE_CHANNEL_DATA_RECV,
+    RESP_CODE_DEFAULT_FLOOD_SCOPE,
     RESP_CODE_OK,
 )
 from pymc_core.companion.frame_server import CompanionFrameServer, _build_advert_push_frames
-from pymc_core.companion.models import Contact, SentResult
+from pymc_core.companion.models import Contact, NodePrefs, QueuedMessage, SentResult
 
 
 def test_build_advert_push_frames_short_only_when_no_name():
@@ -121,6 +125,33 @@ class _MockBridgeSendRawDirect:
         return SentResult(success=self._success)
 
 
+class _MockBridgeChannelData:
+    """Minimal bridge for CMD_SEND_CHANNEL_DATA/default-scope tests."""
+
+    def __init__(self, send_ok: bool = True):
+        self._send_ok = send_ok
+        self._channel = object()
+        self.calls = []
+        self.default_scope = None
+
+    def get_channel(self, idx: int):
+        return self._channel if idx == 1 else None
+
+    async def send_channel_data(self, channel_idx, data_type, payload, *, path=None, path_len_encoded=None):
+        self.calls.append((channel_idx, data_type, payload, path, path_len_encoded))
+        return self._send_ok
+
+    def set_default_flood_scope(self, name, key):
+        if not name or not key:
+            self.default_scope = None
+            return True
+        self.default_scope = (name, bytes(key))
+        return True
+
+    def get_default_flood_scope(self):
+        return self.default_scope
+
+
 @pytest.mark.asyncio
 async def test_cmd_send_raw_data_valid_writes_ok():
     """Valid CMD_SEND_RAW_DATA -> _write_ok."""
@@ -137,6 +168,51 @@ async def test_cmd_send_raw_data_valid_writes_ok():
     assert path_len_enc == 1  # 1-byte hash, 1 hop
     server._write_ok.assert_called_once()
     server._write_err.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_channel_data_valid_direct_path():
+    """CMD_SEND_CHANNEL_DATA parses path/data_type/payload and delegates to bridge."""
+    from pymc_core.protocol.packet_utils import PathUtils
+
+    bridge = _MockBridgeChannelData(send_ok=True)
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_ok = Mock()
+    server._write_err = Mock()
+
+    path_len = PathUtils.encode_path_len(1, 2)  # two 1-byte hops
+    payload = b"\xDE\xAD\xBE"
+    data = bytes([1, path_len, 0x10, 0x20, 0x34, 0x12]) + payload
+    await server._cmd_send_channel_data(data)
+
+    assert bridge.calls == [(1, 0x1234, payload, b"\x10\x20", path_len)]
+    server._write_ok.assert_called_once()
+    server._write_err.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_channel_data_invalid_type_zero():
+    """CMD_SEND_CHANNEL_DATA rejects DATA_TYPE_RESERVED (0)."""
+    bridge = _MockBridgeChannelData(send_ok=True)
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_ok = Mock()
+    server._write_err = Mock()
+
+    # channel=1, flood path (0xFF), data_type=0x0000, payload=b"x"
+    await server._cmd_send_channel_data(bytes([1, 0xFF, 0x00, 0x00, 0x78]))
+    server._write_err.assert_called_once_with(ERR_CODE_ILLEGAL_ARG)
+    server._write_ok.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_channel_data_unknown_channel():
+    """CMD_SEND_CHANNEL_DATA returns NOT_FOUND for unknown channel index."""
+    bridge = _MockBridgeChannelData(send_ok=True)
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_err = Mock()
+
+    await server._cmd_send_channel_data(bytes([2, 0xFF, 0x34, 0x12]))
+    server._write_err.assert_called_once_with(ERR_CODE_NOT_FOUND)
 
 
 @pytest.mark.asyncio
@@ -259,6 +335,63 @@ async def test_cmd_send_raw_data_truncated_multibyte_path():
     await server._cmd_send_raw_data(data)
     assert len(bridge.calls) == 0
     server._write_err.assert_called_once_with(ERR_CODE_UNSUPPORTED_CMD)
+
+
+@pytest.mark.asyncio
+async def test_default_flood_scope_set_get_and_clear():
+    """Default flood scope commands encode/decode firmware-compatible payloads."""
+    bridge = _MockBridgeChannelData()
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    frames = []
+    server._write_frame = lambda f: frames.append(f)
+    server._write_ok = Mock()
+    server._write_err = Mock()
+
+    scope_name = "regionA"
+    name_field = scope_name.encode("utf-8").ljust(31, b"\x00")
+    key = bytes(range(16))
+
+    await server._cmd_set_default_flood_scope(name_field + key)
+    server._write_ok.assert_called_once()
+    assert bridge.default_scope == (scope_name, key)
+
+    await server._cmd_get_default_flood_scope(b"")
+    assert frames[-1][0] == RESP_CODE_DEFAULT_FLOOD_SCOPE
+    assert frames[-1][1:32].split(b"\x00", 1)[0] == scope_name.encode("utf-8")
+    assert frames[-1][32:48] == key
+
+    await server._cmd_set_default_flood_scope(b"")
+    assert bridge.default_scope is None
+    await server._cmd_get_default_flood_scope(b"")
+    assert frames[-1] == bytes([RESP_CODE_DEFAULT_FLOOD_SCOPE])
+
+
+def test_build_message_frame_channel_data_v15():
+    """Queued binary channel data encodes as RESP_CODE_CHANNEL_DATA_RECV."""
+    bridge = Mock()
+    bridge.get_time = Mock(return_value=0)
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._app_target_ver = 3
+    msg = QueuedMessage(
+        sender_key=b"",
+        txt_type=0,
+        timestamp=0,
+        text="",
+        is_channel=True,
+        channel_idx=4,
+        path_len=0xFF,
+        snr=2.0,
+        rssi=-90,
+        channel_data_type=0x1234,
+        channel_data_payload=b"\xAA\xBB",
+    )
+    frame = server._build_message_frame(msg)
+    assert frame[0] == RESP_CODE_CHANNEL_DATA_RECV
+    assert frame[4] == 4
+    assert frame[5] == 0xFF
+    assert frame[6:8] == b"\x34\x12"
+    assert frame[8] == 2
+    assert frame[9:11] == b"\xAA\xBB"
 
 
 @pytest.mark.asyncio

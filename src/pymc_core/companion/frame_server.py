@@ -44,6 +44,7 @@ from .constants import (
     CMD_RESET_PATH,
     CMD_SEND_ANON_REQ,
     CMD_SEND_BINARY_REQ,
+    CMD_SEND_CHANNEL_DATA,
     CMD_SEND_CHANNEL_TXT_MSG,
     CMD_SEND_CONTROL_DATA,
     CMD_SEND_LOGIN,
@@ -60,7 +61,9 @@ from .constants import (
     CMD_SET_CHANNEL,
     CMD_SET_CUSTOM_VAR,
     CMD_SET_DEVICE_TIME,
+    CMD_SET_DEFAULT_FLOOD_SCOPE,
     CMD_SET_FLOOD_SCOPE,
+    CMD_GET_DEFAULT_FLOOD_SCOPE,
     CMD_SET_OTHER_PARAMS,
     CMD_SET_PATH_HASH_MODE,
     CMD_SET_RADIO_PARAMS,
@@ -77,8 +80,10 @@ from .constants import (
     FRAME_INBOUND_PREFIX,
     FRAME_OUTBOUND_PREFIX,
     MAX_FRAME_SIZE,
+    MAX_CHANNEL_DATA_LENGTH,
     MAX_PATH_SIZE,
     MAX_PAYLOAD_SIZE,
+    OUT_PATH_UNKNOWN,
     PUB_KEY_SIZE,
     PUSH_CODE_ADVERT,
     PUSH_CODE_BINARY_RESPONSE,
@@ -100,7 +105,9 @@ from .constants import (
     RESP_CODE_ADVERT_PATH,
     RESP_CODE_AUTOADD_CONFIG,
     RESP_CODE_BATT_AND_STORAGE,
+    RESP_CODE_CHANNEL_DATA_RECV,
     RESP_CODE_CHANNEL_INFO,
+    RESP_CODE_DEFAULT_FLOOD_SCOPE,
     RESP_CODE_CHANNEL_MSG_RECV,
     RESP_CODE_CHANNEL_MSG_RECV_V3,
     RESP_CODE_CONTACT,
@@ -222,6 +229,7 @@ class CompanionFrameServer:
             CMD_GET_CONTACT_BY_KEY: self._cmd_get_contact_by_key,
             CMD_SEND_TXT_MSG: self._cmd_send_txt_msg,
             CMD_SEND_CHANNEL_TXT_MSG: self._cmd_send_channel_txt_msg,
+            CMD_SEND_CHANNEL_DATA: self._cmd_send_channel_data,
             CMD_SYNC_NEXT_MESSAGE: self._cmd_sync_next_message,
             CMD_SEND_LOGIN: self._cmd_send_login,
             CMD_SEND_STATUS_REQ: self._cmd_send_status_req,
@@ -244,6 +252,8 @@ class CompanionFrameServer:
             CMD_SEND_CONTROL_DATA: self._cmd_send_control_data,
             CMD_SEND_TRACE_PATH: self._cmd_send_trace_path,
             CMD_SET_FLOOD_SCOPE: self._cmd_set_flood_scope,
+            CMD_SET_DEFAULT_FLOOD_SCOPE: self._cmd_set_default_flood_scope,
+            CMD_GET_DEFAULT_FLOOD_SCOPE: self._cmd_get_default_flood_scope,
             CMD_GET_DEVICE_TIME: self._cmd_get_device_time,
             CMD_SET_DEVICE_TIME: self._cmd_set_device_time,
             CMD_SET_RADIO_PARAMS: self._cmd_set_radio_params,
@@ -457,6 +467,32 @@ class CompanionFrameServer:
             await self._persist_companion_message(msg_dict)
             _write_push(bytes([PUSH_CODE_MSG_WAITING]))
 
+        async def on_channel_data_received(
+            channel_idx,
+            path_len,
+            data_type,
+            payload,
+            packet_hash=None,
+            snr=None,
+            rssi=None,
+        ):
+            msg_dict = {
+                "sender_key": b"",
+                "text": "",
+                "timestamp": 0,
+                "txt_type": 0,
+                "is_channel": True,
+                "channel_idx": channel_idx,
+                "path_len": path_len,
+                "packet_hash": packet_hash,
+                "snr": snr,
+                "rssi": rssi,
+                "channel_data_type": data_type,
+                "channel_data_payload": bytes(payload or b""),
+            }
+            await self._persist_companion_message(msg_dict)
+            _write_push(bytes([PUSH_CODE_MSG_WAITING]))
+
         def on_binary_response(tag_bytes, response_data, parsed=None, request_type=None):
             frame = (
                 bytes([PUSH_CODE_BINARY_RESPONSE, 0])
@@ -505,6 +541,7 @@ class CompanionFrameServer:
 
         self.bridge.on_message_received(on_message_received)
         self.bridge.on_channel_message_received(on_channel_message_received)
+        self.bridge.on_channel_data_received(on_channel_data_received)
         self.bridge.on_send_confirmed(on_send_confirmed)
         self.bridge.on_advert_received(on_advert_received)
         self.bridge.on_contact_path_updated(on_contact_path_updated)
@@ -1105,6 +1142,52 @@ class CompanionFrameServer:
                 channel_idx,
             )
 
+    async def _cmd_send_channel_data(self, data: bytes) -> None:
+        """Handle CMD_SEND_CHANNEL_DATA (62)."""
+        if len(data) < 4:
+            self._write_err(ERR_CODE_ILLEGAL_ARG)
+            return
+        channel_idx = data[0]
+        path_len = data[1]
+        if self.bridge.get_channel(channel_idx) is None:
+            self._write_err(ERR_CODE_NOT_FOUND)
+            return
+        offset = 2
+        path = b""
+        if path_len != OUT_PATH_UNKNOWN:
+            if not PathUtils.is_valid_path_len(path_len):
+                self._write_err(ERR_CODE_ILLEGAL_ARG)
+                return
+            path_byte_len = PathUtils.get_path_byte_len(path_len)
+            if len(data) < offset + path_byte_len + 2:
+                self._write_err(ERR_CODE_ILLEGAL_ARG)
+                return
+            path = data[offset : offset + path_byte_len]
+            offset += path_byte_len
+        if len(data) < offset + 2:
+            self._write_err(ERR_CODE_ILLEGAL_ARG)
+            return
+        data_type = int.from_bytes(data[offset : offset + 2], "little")
+        payload = data[offset + 2 :]
+        if data_type == 0 or len(payload) > MAX_CHANNEL_DATA_LENGTH:
+            self._write_err(ERR_CODE_ILLEGAL_ARG)
+            return
+        send_channel_data = getattr(self.bridge, "send_channel_data", None)
+        if not send_channel_data:
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+            return
+        ok = await send_channel_data(
+            channel_idx,
+            data_type,
+            payload,
+            path=path if path_len != OUT_PATH_UNKNOWN else None,
+            path_len_encoded=path_len,
+        )
+        if ok:
+            self._write_ok()
+        else:
+            self._write_err(ERR_CODE_TABLE_FULL)
+
     async def _cmd_send_binary_req(self, data: bytes) -> None:
         if len(data) < 33:
             self._write_err(ERR_CODE_ILLEGAL_ARG)
@@ -1264,6 +1347,24 @@ class CompanionFrameServer:
             snr_byte += 256
         if msg.is_channel:
             path_len_byte = msg.path_len if msg.path_len < 256 else 0xFF
+            if getattr(msg, "channel_data_type", 0):
+                payload = bytes(getattr(msg, "channel_data_payload", b"") or b"")
+                payload = payload[:MAX_CHANNEL_DATA_LENGTH]
+                return (
+                    bytes(
+                        [
+                            RESP_CODE_CHANNEL_DATA_RECV,
+                            snr_byte & 0xFF,
+                            0,
+                            0,
+                            msg.channel_idx,
+                            path_len_byte,
+                        ]
+                    )
+                    + struct.pack("<H", msg.channel_data_type & 0xFFFF)
+                    + bytes([len(payload)])
+                    + payload
+                )
             txt_type = 0
             text_bytes = (msg.text or "").rstrip("\x00").encode("utf-8", errors="replace")
             if self._app_target_ver >= 3:
@@ -1667,6 +1768,34 @@ class CompanionFrameServer:
             self.bridge.set_flood_scope(None)
         self._write_ok()
 
+    async def _cmd_set_default_flood_scope(self, data: bytes) -> None:
+        """Handle CMD_SET_DEFAULT_FLOOD_SCOPE (63)."""
+        if len(data) < 31 + 16:
+            self.bridge.set_default_flood_scope(None, None)
+            self._write_ok()
+            return
+        name_raw = data[:31]
+        key = data[31 : 31 + 16]
+        scope_name = name_raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace").strip()
+        if not scope_name or len(scope_name) >= 31:
+            self._write_err(ERR_CODE_ILLEGAL_ARG)
+            return
+        if not self.bridge.set_default_flood_scope(scope_name, key):
+            self._write_err(ERR_CODE_ILLEGAL_ARG)
+            return
+        self._write_ok()
+
+    async def _cmd_get_default_flood_scope(self, data: bytes) -> None:
+        """Handle CMD_GET_DEFAULT_FLOOD_SCOPE (64)."""
+        scope = self.bridge.get_default_flood_scope()
+        if scope is None:
+            self._write_frame(bytes([RESP_CODE_DEFAULT_FLOOD_SCOPE]))
+            return
+        name, key = scope
+        name_field = name.encode("utf-8", errors="replace")[:30].ljust(31, b"\x00")
+        key_field = bytes(key[:16]).ljust(16, b"\x00")
+        self._write_frame(bytes([RESP_CODE_DEFAULT_FLOOD_SCOPE]) + name_field + key_field)
+
     # -------------------------------------------------------------------------
     # Time, radio, tuning, share/export, logout, custom vars, autoadd
     # -------------------------------------------------------------------------
@@ -1728,12 +1857,48 @@ class CompanionFrameServer:
     async def _cmd_export_contact(self, data: bytes) -> None:
         if len(data) < PUB_KEY_SIZE:
             raw = self.bridge.export_contact(None)
+            if raw is None:
+                self._write_err(ERR_CODE_NOT_FOUND)
+                return
+            pubkey = raw[:32]
+            name_raw = raw[33:65].split(b"\x00")[0]
+            lat, lon = struct.unpack_from("<ii", raw, 65)
+            flags = 0x01  # IS_CHAT_NODE
+            loc_bytes = b""
+            if lat != 0 or lon != 0:
+                flags |= 0x10  # HAS_LOCATION
+                loc_bytes = struct.pack("<ii", lat, lon)
+            max_name = 32 - 1 - len(loc_bytes)
+            name_bytes = name_raw[:max_name]
+            if name_bytes:
+                flags |= 0x80  # HAS_NAME
+            appdata = bytes([flags]) + loc_bytes + name_bytes
+            timestamp = int(time.time()) & 0xFFFFFFFF
+            ts_bytes = struct.pack("<I", timestamp)
+            to_sign = pubkey + ts_bytes + appdata
+            try:
+                sig = self.bridge._identity.sign(to_sign)
+                if not sig or len(sig) != 64:
+                    self._write_err(ERR_CODE_NOT_FOUND)
+                    return
+            except Exception as e:
+                logger.warning("export_contact: signing failed: %s", e)
+                self._write_err(ERR_CODE_NOT_FOUND)
+                return
+            packet = bytes([0x11, 0x00]) + pubkey + ts_bytes + sig + appdata
+            self._write_frame(bytes([RESP_CODE_EXPORT_CONTACT]) + packet)
         else:
             raw = self.bridge.export_contact(data[:PUB_KEY_SIZE])
-        if raw is None:
-            self._write_err(ERR_CODE_NOT_FOUND)
-            return
-        self._write_frame(bytes([RESP_CODE_EXPORT_CONTACT]) + raw)
+            if raw is None:
+                self._write_err(ERR_CODE_NOT_FOUND)
+                return
+            try:
+                sig = self.bridge._identity.sign(raw)
+                if sig and len(sig) == 64:
+                    raw = raw + sig
+            except Exception as e:
+                logger.warning("export_contact: signing failed: %s", e)
+            self._write_frame(bytes([RESP_CODE_EXPORT_CONTACT]) + raw)
 
     async def _cmd_export_private_key(self, data: bytes) -> None:
         """Export private/signing key as 64-byte MeshCore format (RESP_CODE_PRIVATE_KEY + 64 bytes).

@@ -142,6 +142,8 @@ class NodePrefs:
     # Reported in CMD_DEVICE_QUERY device info frame (byte 80).
     client_repeat: int = 0
     path_hash_mode: int = 0  # 0=1-byte, 1=2-byte, 2=3-byte hashes
+    default_scope_name: str = ""
+    default_scope_key: bytes = b""
 
 
 @dataclass
@@ -189,3 +191,5 @@ class QueuedMessage:
     path_len: int = 0
     snr: float = 0.0
     rssi: int = 0
+    channel_data_type: int = 0
+    channel_data_payload: bytes = b""

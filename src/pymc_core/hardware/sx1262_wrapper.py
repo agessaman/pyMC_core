@@ -24,7 +24,7 @@ class SX1262Radio(LoRaRadio):
     _active_instance = None
 
     # Common timing constants to avoid magic numbers
-    RADIO_TIMING_DELAY = 0.01  # 10ms delay for radio operations
+    RADIO_TIMING_DELAY = 0.01  # 10ms delay for standard radio operations
 
     def __init__(
         self,
@@ -41,6 +41,7 @@ class SX1262Radio(LoRaRadio):
         txled_pin: int = -1,
         rxled_pin: int = -1,
         en_pin: int = -1,
+        en_pins: Optional[list[int]] = None,
         frequency: int = 868000000,
         tx_power: int = 22,
         spreading_factor: int = 7,
@@ -52,6 +53,7 @@ class SX1262Radio(LoRaRadio):
         use_dio3_tcxo: bool = False,
         dio3_tcxo_voltage: float = 1.8,
         use_dio2_rf: bool = False,
+        radio_timing_delay: float = RADIO_TIMING_DELAY,
     ):
         """
         Initialize SX1262 radio
@@ -70,6 +72,7 @@ class SX1262Radio(LoRaRadio):
             txled_pin: GPIO pin for TX LED (default: -1 if not used)
             rxled_pin: GPIO pin for RX LED (default: -1 if not used)
             en_pin: GPIO pin for powering up the radio goes high on init
+            en_pins: GPIO pins for powering up the radio that go high on init
             frequency: Operating frequency in Hz (default: 868MHz)
             tx_power: TX power in dBm (default: 22)
             spreading_factor: LoRa spreading factor (default: 7)
@@ -81,6 +84,7 @@ class SX1262Radio(LoRaRadio):
             use_dio3_tcxo: Enable DIO3 TCXO control (default: False)
             dio3_tcxo_voltage: TCXO reference voltage in volts (default: 1.8)
             use_dio2_rf: Enable DIO2 as RF switch control (default: False)
+            radio_timing_delay: Delay used for radio state transitions (default: 10ms)
         """
         # Check if there's already an active instance and clean it up
         if SX1262Radio._active_instance is not None:
@@ -90,6 +94,8 @@ class SX1262Radio(LoRaRadio):
             except Exception as e:
                 logger.error(f"Error cleaning up previous instance: {e}")
             SX1262Radio._active_instance = None
+
+        self.en_pins = self._normalize_en_pins(en_pin=en_pin, en_pins=en_pins)
 
         self.bus_id = bus_id
         self.cs_id = cs_id
@@ -103,7 +109,8 @@ class SX1262Radio(LoRaRadio):
         self.rxen_pin = rxen_pin
         self.txled_pin = txled_pin
         self.rxled_pin = rxled_pin
-        self.en_pin = en_pin
+        self.en_pin = self.en_pins[0] if self.en_pins else -1
+        self._RADIO_TIMING_DELAY = radio_timing_delay
 
         # Radio configuration
         self.frequency = frequency
@@ -145,7 +152,7 @@ class SX1262Radio(LoRaRadio):
         self._txen_pin_setup = False
         self._txled_pin_setup = False
         self._rxled_pin_setup = False
-        self._en_pin_setup = False
+        self._en_pins_setup = False
 
         self._tx_done_event = asyncio.Event()
         self._rx_done_event = asyncio.Event()
@@ -187,6 +194,23 @@ class SX1262Radio(LoRaRadio):
 
         # RX callback for received packets
         self.rx_callback = None
+
+    @staticmethod
+    def _normalize_en_pins(en_pin: int = -1, en_pins: Optional[list[int]] = None) -> list[int]:
+        normalized_pins = []
+
+        if en_pins:
+            normalized_pins.extend(en_pins)
+        elif en_pin != -1:
+            normalized_pins.append(en_pin)
+
+        deduped_pins = []
+        for pin in normalized_pins:
+            if pin == -1 or pin in deduped_pins:
+                continue
+            deduped_pins.append(pin)
+
+        return deduped_pins
 
     def _get_rx_irq_mask(self) -> int:
         """Get the standard RX interrupt mask"""
@@ -235,9 +259,9 @@ class SX1262Radio(LoRaRadio):
     def _basic_radio_setup(self, use_busy_check: bool = False) -> bool:
         """Common radio setup: reset, standby, and LoRa packet type"""
         self.lora.reset()
-        time.sleep(self.RADIO_TIMING_DELAY)  # Give hardware time to complete reset
+        time.sleep(self._RADIO_TIMING_DELAY)  # Give hardware time to complete reset
         self.lora.setStandby(self.lora.STANDBY_RC)
-        time.sleep(self.RADIO_TIMING_DELAY)  # Give hardware time to enter standby mode
+        time.sleep(self._RADIO_TIMING_DELAY)  # Give hardware time to enter standby mode
 
         # Check if standby mode was set correctly (different methods for different boards)
         if use_busy_check:
@@ -614,13 +638,16 @@ class SX1262Radio(LoRaRadio):
                 else:
                     logger.warning(f"Could not setup RX LED pin {self.rxled_pin}")
 
-            # Setup EN pin if specified (powers up the radio when goes HIGH)
-            if self.en_pin != -1 and not self._en_pin_setup:
-                if self._gpio_manager.setup_output_pin(self.en_pin, initial_value=True):
-                    self._en_pin_setup = True
-                    logger.debug(f"EN pin {self.en_pin} configured and set HIGH")
-                else:
-                    logger.warning(f"Could not setup EN pin {self.en_pin}")
+            # Setup EN pin(s) if specified (powers up the radio when set HIGH)
+            if self.en_pins and not self._en_pins_setup:
+                all_en_pins_configured = True
+                for en_pin in self.en_pins:
+                    if self._gpio_manager.setup_output_pin(en_pin, initial_value=True):
+                        logger.debug(f"EN pin {en_pin} configured and set HIGH")
+                    else:
+                        all_en_pins_configured = False
+                        logger.warning(f"Could not setup EN pin {en_pin}")
+                self._en_pins_setup = all_en_pins_configured
 
             # Basic radio setup
             if not self._basic_radio_setup(use_busy_check=True):
@@ -687,9 +714,9 @@ class SX1262Radio(LoRaRadio):
                 logger.debug("Image calibration for 902-928MHz band")
 
             self.lora.calibrateImage(calFreqMin, calFreqMax)
-            time.sleep(0.01)  # Allow calibration to settle
 
             self.lora.setDio2RfSwitch(self.use_dio2_rf)
+            time.sleep(self._RADIO_TIMING_DELAY)
             if self.use_dio2_rf:
                 logger.info("DIO2 RF switch control enabled")
 
@@ -753,6 +780,7 @@ class SX1262Radio(LoRaRadio):
                     logger.warning(f"Failed to write CAD thresholds: {e}")
 
             self.lora.request(self.lora.RX_CONTINUOUS)
+            time.sleep(self._RADIO_TIMING_DELAY)
 
             self._initialized = True
             logger.info("SX1262 radio initialized successfully")
