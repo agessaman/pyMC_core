@@ -398,12 +398,14 @@ class KissModemWrapper(LoRaRadio):
         """
         with self._connection_lock:
             self.stop_event.clear()
+            self.is_connected = False
             if not self._open_serial_and_start_threads():
                 return False
             if not self._run_post_connect_handshake():
                 self._close_serial_connection()
                 self.is_connected = False
                 return False
+            self.is_connected = True
             self._reconnecting_event.clear()
             self._degraded = False
             self._degraded_reason = None
@@ -439,7 +441,7 @@ class KissModemWrapper(LoRaRadio):
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
             )
-            self.is_connected = True
+            self.is_connected = False
 
             self.rx_thread = threading.Thread(target=self._rx_worker, daemon=True)
             self.tx_thread = threading.Thread(target=self._tx_worker, daemon=True)
@@ -593,6 +595,7 @@ class KissModemWrapper(LoRaRadio):
             with self._connection_lock:
                 if self.stop_event.is_set():
                     break
+                self.is_connected = False
                 self._stop_io_threads(join_timeout=0.5)
                 if not self._open_serial_and_start_threads():
                     continue
@@ -600,6 +603,7 @@ class KissModemWrapper(LoRaRadio):
                     self._close_serial_connection()
                     self.is_connected = False
                     continue
+                self.is_connected = True
                 self._degraded = False
                 self._degraded_reason = None
                 logger.info("KISS modem serial reconnect successful on attempt %s", attempts)
@@ -744,8 +748,8 @@ class KissModemWrapper(LoRaRadio):
         Returns:
             True if configuration successful, False otherwise
         """
-        if not self.is_connected:
-            logger.error("Cannot configure radio: not connected")
+        if not self.serial_conn or not self.serial_conn.is_open:
+            logger.error("Cannot configure radio: serial link not ready")
             return False
 
         try:
@@ -1738,7 +1742,11 @@ class KissModemWrapper(LoRaRadio):
 
     def _rx_worker(self):
         """Background thread for receiving data"""
-        while not self.stop_event.is_set() and self.is_connected:
+        while (
+            not self.stop_event.is_set()
+            and self.serial_conn is not None
+            and self.serial_conn.is_open
+        ):
             try:
                 if self.serial_conn and self.serial_conn.in_waiting > 0:
                     data = self.serial_conn.read(self.serial_conn.in_waiting)
@@ -1757,7 +1765,11 @@ class KissModemWrapper(LoRaRadio):
 
     def _tx_worker(self):
         """Background thread for sending data"""
-        while not self.stop_event.is_set() and self.is_connected:
+        while (
+            not self.stop_event.is_set()
+            and self.serial_conn is not None
+            and self.serial_conn.is_open
+        ):
             try:
                 if self.tx_buffer:
                     frame = self.tx_buffer.popleft()

@@ -669,6 +669,7 @@ class TestRadioConfiguration:
 
         modem._send_command = mock_send_command
         modem.is_connected = True
+        modem.serial_conn = MagicMock(is_open=True)
 
         result = modem.configure_radio()
 
@@ -1334,6 +1335,7 @@ class TestRadioConfigCompatibility:
 
         modem._send_command = mock_send_command
         modem.is_connected = True
+        modem.serial_conn = MagicMock(is_open=True)
 
         modem.configure_radio()
 
@@ -1358,6 +1360,7 @@ class TestRadioConfigCompatibility:
 
         modem._send_command = mock_send_command
         modem.is_connected = True
+        modem.serial_conn = MagicMock(is_open=True)
 
         modem.configure_radio()
 
@@ -1382,6 +1385,7 @@ class TestRadioConfigCompatibility:
 
         modem._send_command = mock_send_command
         modem.is_connected = True
+        modem.serial_conn = MagicMock(is_open=True)
 
         modem.configure_radio()
 
@@ -1669,4 +1673,52 @@ class TestSerialRecovery:
         modem._run_post_connect_handshake = MagicMock(return_value=True)
 
         assert modem.connect() is True
+        assert modem.is_connected is True
+        assert modem._reconnecting_event.is_set() is False
+
+    def test_connect_sets_connected_only_after_handshake_success(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._open_serial_and_start_threads = MagicMock(return_value=True)
+
+        def handshake() -> bool:
+            # is_connected should stay false until handshake fully succeeds.
+            assert modem.is_connected is False
+            return True
+
+        modem._run_post_connect_handshake = MagicMock(side_effect=handshake)
+
+        assert modem.connect() is True
+        assert modem.is_connected is True
+
+    def test_connect_handshake_failure_leaves_disconnected(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._open_serial_and_start_threads = MagicMock(return_value=True)
+        modem._run_post_connect_handshake = MagicMock(return_value=False)
+        modem._close_serial_connection = MagicMock()
+
+        assert modem.connect() is False
+        assert modem.is_connected is False
+        modem._close_serial_connection.assert_called_once()
+
+    def test_reconnect_sets_connected_only_after_handshake_success(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._reconnecting_event.set()
+        modem._degraded = True
+        modem._degraded_reason = "test failure"
+        modem._reconnect_base_delay_s = 0.0
+        modem._reconnect_max_delay_s = 0.0
+        modem._open_serial_and_start_threads = MagicMock(return_value=True)
+
+        def reconnect_handshake() -> bool:
+            assert modem.is_connected is False
+            return True
+
+        modem._run_post_connect_handshake = MagicMock(side_effect=reconnect_handshake)
+        modem._stop_io_threads = MagicMock()
+
+        with patch("pymc_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None):
+            modem._reconnect_worker()
+
+        assert modem.is_connected is True
+        assert modem._degraded is False
         assert modem._reconnecting_event.is_set() is False
