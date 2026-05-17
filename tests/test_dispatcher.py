@@ -495,6 +495,21 @@ class TestDispatcherSendPacket:
 
         assert result is True
 
+    @pytest.mark.asyncio
+    async def test_send_packet_returns_false_when_radio_send_returns_none(self, dispatcher):
+        """If radio.send returns None, dispatcher must fail the send."""
+        packet = Packet()
+        packet.header = (0 << 6) | (0 << 4) | (PAYLOAD_TYPE_ADVERT << 2) | 0
+        packet.payload = bytearray(b"test_packet_data")
+        packet.payload_len = len(packet.payload)
+        packet.path_len = 0
+
+        dispatcher.radio.send = AsyncMock(return_value=None)
+
+        result = await dispatcher.send_packet(packet, wait_for_ack=False)
+
+        assert result is False
+
     def test_own_packet_detection(self, dispatcher):
         """Test detection of own packets."""
         # Create packet with our own address as source

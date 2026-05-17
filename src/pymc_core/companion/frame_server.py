@@ -35,6 +35,7 @@ from .constants import (
     CMD_GET_CONTACT_BY_KEY,
     CMD_GET_CONTACTS,
     CMD_GET_CUSTOM_VARS,
+    CMD_GET_DEFAULT_FLOOD_SCOPE,
     CMD_GET_DEVICE_TIME,
     CMD_GET_STATS,
     CMD_IMPORT_CONTACT,
@@ -60,10 +61,9 @@ from .constants import (
     CMD_SET_AUTOADD_CONFIG,
     CMD_SET_CHANNEL,
     CMD_SET_CUSTOM_VAR,
-    CMD_SET_DEVICE_TIME,
     CMD_SET_DEFAULT_FLOOD_SCOPE,
+    CMD_SET_DEVICE_TIME,
     CMD_SET_FLOOD_SCOPE,
-    CMD_GET_DEFAULT_FLOOD_SCOPE,
     CMD_SET_OTHER_PARAMS,
     CMD_SET_PATH_HASH_MODE,
     CMD_SET_RADIO_PARAMS,
@@ -79,8 +79,8 @@ from .constants import (
     FIRMWARE_VER_CODE,
     FRAME_INBOUND_PREFIX,
     FRAME_OUTBOUND_PREFIX,
-    MAX_FRAME_SIZE,
     MAX_CHANNEL_DATA_LENGTH,
+    MAX_FRAME_SIZE,
     MAX_PATH_SIZE,
     MAX_PAYLOAD_SIZE,
     OUT_PATH_UNKNOWN,
@@ -107,7 +107,6 @@ from .constants import (
     RESP_CODE_BATT_AND_STORAGE,
     RESP_CODE_CHANNEL_DATA_RECV,
     RESP_CODE_CHANNEL_INFO,
-    RESP_CODE_DEFAULT_FLOOD_SCOPE,
     RESP_CODE_CHANNEL_MSG_RECV,
     RESP_CODE_CHANNEL_MSG_RECV_V3,
     RESP_CODE_CONTACT,
@@ -116,6 +115,7 @@ from .constants import (
     RESP_CODE_CONTACTS_START,
     RESP_CODE_CURR_TIME,
     RESP_CODE_CUSTOM_VARS,
+    RESP_CODE_DEFAULT_FLOOD_SCOPE,
     RESP_CODE_DEVICE_INFO,
     RESP_CODE_END_OF_CONTACTS,
     RESP_CODE_ERR,
@@ -1134,13 +1134,8 @@ class CompanionFrameServer:
         if self.bridge.get_channel(channel_idx) is None:
             self._write_err(ERR_CODE_NOT_FOUND)
             return
-        self._write_ok()
         ok = await self.bridge.send_channel_message(channel_idx, text)
-        if not ok:
-            logger.warning(
-                "Channel message send failed for channel %d after OK response was already sent",
-                channel_idx,
-            )
+        self._write_ok() if ok else self._write_err(ERR_CODE_BAD_STATE)
 
     async def _cmd_send_channel_data(self, data: bytes) -> None:
         """Handle CMD_SEND_CHANNEL_DATA (62)."""

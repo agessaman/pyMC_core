@@ -1163,9 +1163,11 @@ class KissModemWrapper(LoRaRadio):
         if self.lbt_enabled:
             _, lbt_backoff_delays = await self._prepare_for_tx_lbt()
 
-        success = self.send_frame(data)
+        # Wait for modem-level TX_DONE instead of treating queueing as success.
+        # Run the blocking wait off the event loop.
+        success = await asyncio.to_thread(self.send_frame_and_wait, data, RESPONSE_TIMEOUT)
         if not success:
-            raise Exception("Failed to send frame via KISS modem")
+            raise Exception("Failed to send frame via KISS modem (no TX_DONE)")
 
         # Use short timeout for GET_AIRTIME so TX path is not blocked if modem
         # is busy or unresponsive (avoids 5s stall and subsequent bad state).

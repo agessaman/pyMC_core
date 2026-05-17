@@ -544,6 +544,10 @@ class Dispatcher:
             self._log(f"Radio transmit error: {e}")
             self.state = DispatcherState.IDLE
             return False
+        if tx_metadata is None:
+            self._log("Radio transmit returned no confirmation metadata")
+            self.state = DispatcherState.IDLE
+            return False
         # Log what we sent
         type_name = PAYLOAD_TYPES.get(payload_type, f"UNKNOWN_{payload_type}")
         route_name = ROUTE_TYPES.get(packet.get_route_type(), f"UNKNOWN_{packet.get_route_type()}")

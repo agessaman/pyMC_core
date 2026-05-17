@@ -999,3 +999,31 @@ class TestContextManager:
                 mock_connect.assert_called_once()
                 mock_disconnect.assert_called_once()
                 _ = modem  # hold ref so __del__ runs after assert, not before
+
+
+class TestAsyncSendTxDone:
+    """Test async send() TX_DONE confirmation behavior."""
+
+    @pytest.mark.asyncio
+    async def test_send_returns_metadata_after_tx_done(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem.lbt_enabled = False
+        modem.send_frame_and_wait = MagicMock(return_value=True)
+        modem.get_airtime = MagicMock(return_value=123)
+
+        result = await modem.send(b"\x01\x02\x03\x04")
+
+        assert result["airtime_ms"] == 123
+        assert result["lbt_attempts"] == 0
+        modem.send_frame_and_wait.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_send_raises_when_tx_done_not_received(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem.lbt_enabled = False
+        modem.send_frame_and_wait = MagicMock(return_value=False)
+
+        with pytest.raises(Exception, match="TX_DONE"):
+            await modem.send(b"\x01\x02\x03\x04")
