@@ -151,6 +151,8 @@ class TCPLoRaRadio(_RadioBase):
         # Stats
         self._tx_count = 0
         self._rx_count = 0
+        self._crc_errors = 0
+        self.crc_error_count = 0
 
         logger.info(
             f"TCPLoRaRadio configured: {host}:{port} "
@@ -359,7 +361,9 @@ class TCPLoRaRadio(_RadioBase):
 
         if self._event_loop:
             self._event_loop.call_soon_threadsafe(
-                lambda: self._event_loop.create_task(self.refresh_noise_floor())
+                lambda: self._event_loop.create_task(
+                    self._refresh_background_metrics()
+                )
             )
         return True
 
@@ -380,6 +384,8 @@ class TCPLoRaRadio(_RadioBase):
             "port": self.port,
             "tx_count": self._tx_count,
             "rx_count": self._rx_count,
+            "crc_errors": self._crc_errors,
+            "crc_error_count": self.crc_error_count,
         }
 
     async def get_modem_status(self) -> Optional[dict]:
@@ -390,7 +396,7 @@ class TCPLoRaRadio(_RadioBase):
         )
         if resp and len(resp) >= STATUS_RESP_SIZE:
             fields = struct.unpack(STATUS_RESP_FMT, resp[:STATUS_RESP_SIZE])
-            return {
+            status = {
                 "uptime_sec": fields[0],
                 "rx_count": fields[1],
                 "tx_count": fields[2],
@@ -401,7 +407,20 @@ class TCPLoRaRadio(_RadioBase):
                 "temp_c": fields[7],
                 "radio_state": ["idle/rx", "tx", "error"][min(fields[8], 2)],
             }
+            self._crc_errors = status["crc_errors"]
+            self.crc_error_count = status["crc_errors"]
+            return status
         return None
+
+    async def _refresh_background_metrics(self) -> None:
+        try:
+            await self.refresh_noise_floor()
+        except Exception as e:
+            logger.debug(f"Noise-floor refresh failed: {e}")
+        try:
+            await self.get_modem_status()
+        except Exception as e:
+            logger.debug(f"Status refresh failed: {e}")
 
     def get_noise_floor(self) -> Optional[float]:
         if not self._initialized:
