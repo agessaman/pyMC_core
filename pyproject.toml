@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pymc_core"
-version = "1.0.11"
+version = "1.0.12"
 authors = [
-    {name = "Lloyd Newton", email = "lloyd@rightup.co.uk"},
+    {name = "Rightup", email = "rightup@pymc.dev"},
 ]
 description = "A Python MeshCore library with SPI LoRa radio support"
 readme = "README.md"
@@ -66,10 +66,10 @@ docs = [
 all = ["pymc_core[hardware,websocket,dev,docs]"]
 
 [project.urls]
-Homepage = "https://github.com/rightup/pyMC_core"
-Documentation = "https://rightup.github.io/rightup/pyMC_core"
-Repository = "https://github.com/rightup/pyMC_core.git"
-Issues = "https://github.com/rightup/pyMC_core/issues"
+Homepage = "https://github.com/pyMC-dev/pyMC_core/"
+Documentation = "https://rightup.github.io/pymc_dev/pyMC_core"
+Repository = "https://github.com/pyMC-dev/pyMC_core.git"
+Issues = "https://github.com/pyMC-dev/pyMC_core/issues"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
