@@ -283,12 +283,12 @@ class TestDispatcherACKSystem:
     def test_recent_ack_cleanup(self, dispatcher):
         """Test cleanup of old recent ACKs."""
         crc = 0x12345678
-        old_time = asyncio.get_event_loop().time() - 10  # 10 seconds ago
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        old_time = loop.time() - 10  # 10 seconds ago
         dispatcher._recent_acks[crc] = old_time
 
         # Simulate cleanup
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         try:
             now = loop.time()
             dispatcher._recent_acks = {

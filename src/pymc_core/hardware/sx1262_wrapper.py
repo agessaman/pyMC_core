@@ -362,9 +362,9 @@ class SX1262Radio(LoRaRadio):
 
         except Exception as e:
             logger.error(f"IRQ handler error: {e}")
-            # Fallback: set both events if we can't read status
             self._tx_done_event.set()
-            self._rx_done_event.set()
+            if not self._tx_lock.locked():
+                self._rx_done_event.set()
 
     def set_rx_callback(self, callback):
         """Set a callback to be called with each received packet (bytes)."""
@@ -506,16 +506,20 @@ class SX1262Radio(LoRaRadio):
                             else:
                                 logger.debug(f"[RX] Other interrupt: 0x{irqStat:04X}")
 
-                            # Always restore RX continuous mode after processing any interrupt
-                            # This ensures the radio stays ready for the next packet
-                            try:
-                                self.lora.request(self.lora.RX_CONTINUOUS)
-                                await asyncio.sleep(self.RADIO_TIMING_DELAY)
+                            if not self._tx_lock.locked():
+                                try:
+                                    self.lora.request(self.lora.RX_CONTINUOUS)
+                                    await asyncio.sleep(self.RADIO_TIMING_DELAY)
+                                    logger.debug(
+                                        f"[RX] Restored RX continuous mode after IRQ 0x{irqStat:04X}"
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Failed to restore RX mode: {e}")
+                            else:
                                 logger.debug(
-                                    f"[RX] Restored RX continuous mode after IRQ 0x{irqStat:04X}"
+                                    f"[RX] Skipped RX restore after IRQ 0x{irqStat:04X}"
+                                    " — TX lock held, send() will restore RX on completion"
                                 )
-                            except Exception as e:
-                                logger.error(f"Failed to restore RX mode: {e}")
                         except Exception as e:
                             logger.error(f"[IRQ RX] Error processing received packet: {e}")
                         finally:
@@ -920,6 +924,7 @@ class SX1262Radio(LoRaRadio):
     async def _prepare_radio_for_tx(self) -> tuple[bool, list[float]]:
         """Prepare radio hardware for transmission. Returns (success, lbt_backoff_delays_ms)."""
         self._tx_done_event.clear()
+        self._rx_done_event.clear()
         self.lora.setStandby(self.lora.STANDBY_RC)
         await asyncio.sleep(self.RADIO_TIMING_DELAY)  # Give hardware time to enter standby
         if self.lora.busyCheck():
