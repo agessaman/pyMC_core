@@ -1645,13 +1645,14 @@ class SX1262Radio(LoRaRadio):
                 rx_mask = self._get_rx_irq_mask()
                 self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
                 await asyncio.sleep(0.001)
-                self.lora.request(self.lora.RX_CONTINUOUS)
-                await asyncio.sleep(self.RADIO_TIMING_DELAY)  # Give hardware time to enter RX mode
+                if not self._tx_lock.locked():
+                    self.lora.request(self.lora.RX_CONTINUOUS)
+                    await asyncio.sleep(
+                        self.RADIO_TIMING_DELAY
+                    )  # Give hardware time to enter RX mode
 
                 # Step 7: Final interrupt clear to start fresh
                 self.lora.clearIrqStatus(0xFFFF)
-
-                logger.debug("[CAD] Successfully restored RX mode after CAD operation")
             except Exception as e:
                 logger.warning(f"Failed to restore RX mode after CAD: {e}")
 

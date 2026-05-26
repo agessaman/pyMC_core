@@ -1497,12 +1497,12 @@ class TestHardwareIntegrationIdeas:
 
 
 # ===========================================================================
-# 18. FIFO corruption race regression (Issue #260 / PR #78)
+# 18. FIFO corruption race behavior
 # ===========================================================================
 
 class TestFIFOCorruptionRace:
     """
-    Regression tests for the FIFO corruption race (Issue #260 / PR #78).
+    Behavioral tests for FIFO corruption race windows.
 
     The SX1262 has a 256-byte FIFO shared between TX (base 0x00) and RX
     (base 0x80 = 128).  Any TX packet longer than 128 bytes has its last
@@ -1541,7 +1541,7 @@ class TestFIFOCorruptionRace:
         setTx() fires — the exact window where an incoming packet can corrupt
         FIFO[0x80+] for any TX packet > 128 bytes.
 
-        This test FAILS without the fix and PASSES with it.
+        This test verifies event and lock ordering during TX preparation.
         """
         # Track whether request(RX_CONTINUOUS) is called in the dangerous
         # window: TX lock held AND setTx() not yet called.
@@ -1590,7 +1590,7 @@ class TestFIFOCorruptionRace:
 
         assert rx_re_enabled_in_fifo_window == [], "\n".join([
             "",
-            "FIFO CORRUPTION RACE CONFIRMED (Issue #260):",
+            "FIFO corruption race reproduced:",
             f"  request(RX_CONTINUOUS) was called {len(rx_re_enabled_in_fifo_window)}"
             " time(s) while TX lock was held and before setTx() fired.",
             "  A stale _rx_done_event (set before _tx_lock was acquired) woke",
@@ -1675,7 +1675,7 @@ class TestFIFOCorruptionRace:
         self, radio, mock_lora
     ):
         """
-        Race 2 — background task mid-flight (Issue #260).
+        Background task mid-flight scenario.
 
         _rx_irq_background_task can already be executing (past the _rx_done_event
         wait) when send() acquires _tx_lock.  Before the fix it calls
@@ -1728,7 +1728,7 @@ class TestFIFOCorruptionRace:
 
         assert rx_re_enabled_while_locked == [], "\n".join([
             "",
-            "RACE 2 CONFIRMED — background task mid-flight (Issue #260):",
+            "Background task mid-flight race reproduced:",
             f"  request(RX_CONTINUOUS) was called {len(rx_re_enabled_while_locked)}"
             " time(s) by _rx_irq_background_task while _tx_lock was held.",
             "  The background task was already past the _rx_done_event wait when",
@@ -1737,4 +1737,118 @@ class TestFIFOCorruptionRace:
             "  mid-TX setup. For packets >128 bytes this overwrites FIFO[0x80+].",
             "  Fix: guard request(RX_CONTINUOUS) with `if not self._tx_lock.locked()`",
             "  in _rx_irq_background_task().",
+        ])
+
+    async def test_patched_legacy_sequence_reproduces_fifo_window(
+        self, radio, mock_lora, monkeypatch
+    ):
+        """
+        With SX1262 configured TX=0x00 and RX=0x80, any TX payload >128 bytes
+        overlaps the RX region of the shared 256-byte FIFO, so restoring RX in
+        this window can overwrite the TX tail.
+        """
+        rx_re_enabled_in_fifo_window: list[str] = []
+        setTx_called = False
+
+        def _track_setTx(timeout):
+            nonlocal setTx_called
+            setTx_called = True
+
+        def _track_request(mode):
+            if (
+                mode == mock_lora.RX_CONTINUOUS
+                and radio._tx_lock.locked()
+                and not setTx_called
+            ):
+                rx_re_enabled_in_fifo_window.append(
+                    "request(RX_CONTINUOUS) called during TX prep window"
+                )
+
+        mock_lora.setTx.side_effect = _track_setTx
+        mock_lora.request.side_effect = _track_request
+
+        async def _legacy_prepare_radio_for_tx():
+            radio._tx_done_event.clear()
+            # Intentionally omit: radio._rx_done_event.clear()
+            radio.lora.setStandby(radio.lora.STANDBY_RC)
+            await asyncio.sleep(radio.RADIO_TIMING_DELAY)
+            return True, []
+
+        async def _legacy_rx_irq_background_task():
+            await radio._rx_done_event.wait()
+            radio._rx_done_event.clear()
+            # Intentionally unguarded to emulate legacy behavior.
+            radio.lora.request(radio.lora.RX_CONTINUOUS)
+
+        monkeypatch.setattr(radio, "_prepare_radio_for_tx", _legacy_prepare_radio_for_tx)
+        monkeypatch.setattr(radio, "_rx_irq_background_task", _legacy_rx_irq_background_task)
+
+        # Stale RX event set before send() acquires TX lock.
+        radio._last_irq_status = IRQ_TIMEOUT
+        radio._rx_done_event.set()
+
+        bg_task = asyncio.get_running_loop().create_task(radio._rx_irq_background_task())
+
+        radio.perform_cad = AsyncMock(return_value=False)
+        radio._wait_for_transmission_complete = AsyncMock(return_value=True)
+        radio._finalize_transmission = MagicMock()
+        await radio.send(bytes(136))
+        await bg_task
+
+        write_addr, _, write_len = mock_lora.writeBuffer.call_args[0]
+        assert write_addr == 0x00
+        assert write_len > 128
+        assert rx_re_enabled_in_fifo_window != [], (
+            "Expected legacy sequencing to re-enable RX while TX lock was held "
+            "before setTx(), but it did not trigger."
+        )
+
+    async def test_perform_cad_does_not_restore_rx_while_tx_lock_held(
+        self, radio, mock_lora
+    ):
+        """
+        Race 3: perform_cad() cleanup must not request RX_CONTINUOUS while send()
+        still holds _tx_lock and has not started setTx() yet.
+
+        This is the CAD-specific variant of the FIFO corruption window.
+        """
+        rx_re_enabled_in_fifo_window: list[str] = []
+        setTx_called = False
+
+        def _track_setTx(timeout):
+            nonlocal setTx_called
+            setTx_called = True
+
+        def _track_request(mode):
+            if (
+                mode == mock_lora.RX_CONTINUOUS
+                and radio._tx_lock.locked()
+                and not setTx_called
+            ):
+                rx_re_enabled_in_fifo_window.append(
+                    "perform_cad() restored RX_CONTINUOUS before setTx()"
+                )
+
+        async def _complete_cad_clear(delay: float = 0.02):
+            await asyncio.sleep(delay)
+            radio._last_cad_irq_status = IRQ_CAD_DONE
+            radio._last_cad_detected = False
+            radio._cad_event.set()
+
+        mock_lora.setTx.side_effect = _track_setTx
+        mock_lora.request.side_effect = _track_request
+
+        asyncio.get_running_loop().create_task(_complete_cad_clear())
+
+        radio._wait_for_transmission_complete = AsyncMock(return_value=True)
+        radio._finalize_transmission = MagicMock()
+        await radio.send(bytes(136))
+
+        assert rx_re_enabled_in_fifo_window == [], "\n".join([
+            "",
+            "CAD cleanup race reproduced — RX restored mid-TX prep:",
+            f"  request(RX_CONTINUOUS) was called {len(rx_re_enabled_in_fifo_window)}"
+            " time(s) while _tx_lock was held and before setTx().",
+            "  perform_cad() must not restore RX_CONTINUOUS during active TX prep;",
+            "  send() already restores RX in its finally block after TX completes.",
         ])
