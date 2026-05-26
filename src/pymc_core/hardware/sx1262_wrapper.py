@@ -163,6 +163,7 @@ class SX1262Radio(LoRaRadio):
 
         # Track event loop for thread-safe interrupt handling
         self._event_loop = None
+        self._shutting_down = False
 
         # Store CAD results from interrupt handler
         self._last_cad_detected = False
@@ -230,13 +231,20 @@ class SX1262Radio(LoRaRadio):
 
     def _irq_trampoline(self):
         """Lightweight trampoline called by GPIO thread - schedules real handler on event loop."""
+        if self._shutting_down:
+            return
+
+        loop = self._event_loop
+        if loop is None:
+            return
+
         try:
-            if self._event_loop is not None:
-                self._event_loop.call_soon_threadsafe(self._handle_interrupt)
-            else:
-                logger.warning(
-                    "IRQ received before event loop initialized; ignoring early interrupt"
-                )
+            loop.call_soon_threadsafe(self._handle_interrupt)
+        except RuntimeError as e:
+            if "Event loop is closed" in str(e):
+                self._event_loop = None
+                return
+            logger.error(f"IRQ trampoline runtime error: {e}", exc_info=True)
         except Exception as e:
             logger.error(f"IRQ trampoline error: {e}", exc_info=True)
 
@@ -576,6 +584,8 @@ class SX1262Radio(LoRaRadio):
         if self._initialized:
             logger.debug("SX1262 radio already initialized, skipping")
             return True
+
+        self._shutting_down = False
 
         try:
             logger.debug("Initializing SX1262 radio...")
@@ -1658,6 +1668,17 @@ class SX1262Radio(LoRaRadio):
 
     def cleanup(self) -> None:
         """Clean up radio resources"""
+        self._shutting_down = True
+        self._event_loop = None
+        self._interrupt_setup = False
+
+        if hasattr(self, "_rx_irq_task") and self._rx_irq_task is not None:
+            try:
+                if not self._rx_irq_task.done():
+                    self._rx_irq_task.cancel()
+            except Exception as e:
+                logger.debug(f"Could not cancel RX IRQ task during cleanup: {e}")
+
         if hasattr(self, "lora") and self.lora:
             try:
                 self.lora.end()
@@ -1667,7 +1688,6 @@ class SX1262Radio(LoRaRadio):
         if hasattr(self, "_gpio_manager"):
             self._gpio_manager.cleanup_all()
 
-        self._interrupt_setup = False
         self._initialized = False
 
         if SX1262Radio._active_instance is self:
