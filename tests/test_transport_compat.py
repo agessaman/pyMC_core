@@ -78,6 +78,9 @@ class TestKeyDerivation:
     def test_different_regions_different_keys(self):
         assert get_auto_key_for("#nl-li") != get_auto_key_for("#usa")
 
+    def test_implicit_region_name_matches_explicit_hashtag(self):
+        assert get_auto_key_for("nl-li") == get_auto_key_for("#nl-li")
+
 
 class TestFirmwareCompatibility:
     """

@@ -19,18 +19,21 @@ def get_auto_key_for(name: str) -> bytes:
     void TransportKeyStore::getAutoKeyFor(uint16_t id, const char* name, TransportKey& dest)
 
     Args:
-        name: Region name including '#' (e.g., "#usa")
+        name: Region name (e.g., "#usa" or implicit "usa")
 
     Returns:
         bytes: 16-byte transport key
     """
     if not name:
         raise ValueError("Region name cannot be empty")
-    if not name.startswith("#"):
-        raise ValueError("Region name must start with '#'")
-    if len(name) > 64:
+
+    # Match MeshCore RegionMap behavior: non-hashtag names are treated as
+    # implicit auto-hashtag regions by prepending '#'.
+    canonical_name = name if name.startswith("#") else f"#{name}"
+
+    if len(canonical_name) > 64:
         raise ValueError("Region name is too long (max 64 characters)")
-    key_hash = CryptoUtils.sha256(name.encode("ascii"))
+    key_hash = CryptoUtils.sha256(canonical_name.encode("ascii"))
     return key_hash[:16]  # First 16 bytes (128 bits)
 
 

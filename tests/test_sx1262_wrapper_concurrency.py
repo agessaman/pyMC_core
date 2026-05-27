@@ -384,15 +384,12 @@ class TestIrqTrampoline:
         await asyncio.sleep(0)
         assert called == [True]
 
-    def test_trampoline_with_no_event_loop_logs_warning(self, radio, caplog):
+    def test_trampoline_with_no_event_loop_returns_silently(self, radio, caplog):
         import logging
         radio._event_loop = None
         with caplog.at_level(logging.WARNING, logger="SX1262_wrapper"):
             radio._irq_trampoline()
-        assert any(
-            "event loop" in r.message.lower() or "early interrupt" in r.message.lower()
-            for r in caplog.records
-        )
+        assert caplog.records == []
 
     async def test_trampoline_from_background_thread_is_safe(self, radio):
         """The trampoline is typically called from a GPIO poll thread."""
@@ -1852,3 +1849,695 @@ class TestFIFOCorruptionRace:
             "  perform_cad() must not restore RX_CONTINUOUS during active TX prep;",
             "  send() already restores RX in its finally block after TX completes.",
         ])
+
+
+# ===========================================================================
+# 19. Targeted branch-coverage tests
+# ===========================================================================
+
+class TestCoverageGapBranches:
+    def test_constructor_handles_previous_instance_cleanup_error(self, mock_gpio, caplog):
+        import logging
+        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+
+        previous = MagicMock()
+        previous.cleanup.side_effect = RuntimeError("cleanup failed")
+        SX1262Radio._active_instance = previous
+
+        with (
+            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            caplog.at_level(logging.ERROR, logger="SX1262_wrapper"),
+        ):
+            _ = SX1262Radio(radio_timing_delay=0.0)
+
+        assert any("Error cleaning up previous instance" in r.message for r in caplog.records)
+
+    def test_constructor_uses_existing_gpio_manager(self, mock_gpio):
+        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+
+        with (
+            patch("pymc_core.hardware.lora.LoRaRF.SX126x._gpio_manager", mock_gpio),
+            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager") as gp_patch,
+            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager") as set_patch,
+        ):
+            radio = SX1262Radio(radio_timing_delay=0.0)
+
+        assert radio._gpio_manager is mock_gpio
+        gp_patch.assert_not_called()
+        set_patch.assert_not_called()
+
+    def test_trampoline_early_return_when_shutting_down(self, radio):
+        radio._shutting_down = True
+        radio._event_loop = MagicMock()
+        radio._irq_trampoline()
+        radio._event_loop.call_soon_threadsafe.assert_not_called()
+
+    def test_trampoline_runtime_error_logs_for_non_closed_loop(self, radio, caplog):
+        import logging
+
+        radio._event_loop = MagicMock()
+        radio._event_loop.call_soon_threadsafe.side_effect = RuntimeError("loop boom")
+
+        with caplog.at_level(logging.ERROR, logger="SX1262_wrapper"):
+            radio._irq_trampoline()
+
+        assert any("IRQ trampoline runtime error" in r.message for r in caplog.records)
+
+    def test_trampoline_generic_exception_logs_error(self, radio, caplog):
+        import logging
+
+        radio._event_loop = MagicMock()
+        radio._event_loop.call_soon_threadsafe.side_effect = ValueError("unexpected")
+
+        with caplog.at_level(logging.ERROR, logger="SX1262_wrapper"):
+            radio._irq_trampoline()
+
+        assert any("IRQ trampoline error" in r.message for r in caplog.records)
+
+    def test_setters_return_false_if_uninitialized(self, radio):
+        radio._initialized = False
+        assert radio.set_frequency(868100000) is False
+        assert radio.set_tx_power(14) is False
+        assert radio.set_spreading_factor(9) is False
+        assert radio.set_bandwidth(250000) is False
+
+    def test_setters_update_driver_and_state(self, radio, mock_lora):
+        assert radio.set_frequency(915000000) is True
+        assert radio.set_tx_power(17) is True
+        assert radio.set_spreading_factor(10) is True
+        assert radio.set_bandwidth(250000) is True
+
+        assert radio.frequency == 915000000
+        assert radio.tx_power == 17
+        assert radio.spreading_factor == 10
+        assert radio.bandwidth == 250000
+        mock_lora.setFrequency.assert_called_once_with(915000000)
+
+    def test_set_tx_power_returns_false_when_driver_raises(self, radio, mock_lora):
+        mock_lora.setTxPower.side_effect = RuntimeError("txpower failed")
+        assert radio.set_tx_power(20) is False
+
+    async def test_wait_for_tx_timeout_clear_irq_exception_swallowed(self, radio, mock_lora):
+        radio._tx_done_event.clear()
+        mock_lora.getIrqStatus.return_value = IRQ_TIMEOUT
+        mock_lora.clearIrqStatus.side_effect = RuntimeError("clear failed")
+        assert await radio._wait_for_transmission_complete(0.2) is False
+
+    async def test_handle_transmission_timeout_logs_configuration_issue(self, radio, mock_lora, caplog):
+        import logging
+
+        mock_lora.getIrqStatus.return_value = IRQ_TIMEOUT
+        with caplog.at_level(logging.ERROR, logger="SX1262_wrapper"):
+            await radio._handle_transmission_timeout(0.2, time.time())
+        assert any("configuration issue" in r.message.lower() for r in caplog.records)
+
+    def test_finalize_transmission_timeout_warning_path(self, radio, mock_lora, caplog):
+        import logging
+
+        mock_lora.getIrqStatus.return_value = IRQ_TIMEOUT
+        with caplog.at_level(logging.WARNING, logger="SX1262_wrapper"):
+            radio._finalize_transmission()
+        assert any("TX_TIMEOUT" in r.message for r in caplog.records)
+
+    def test_finalize_transmission_logs_stats_when_available(self, radio, mock_lora):
+        mock_lora.getIrqStatus.return_value = IRQ_TX_DONE
+        mock_lora.transmitTime.return_value = 12.5
+        mock_lora.dataRate.return_value = 32.0
+        radio._finalize_transmission()
+        mock_lora.dataRate.assert_called_once()
+
+    def test_finalize_transmission_stats_exception_is_swallowed(self, radio, mock_lora):
+        mock_lora.getIrqStatus.return_value = IRQ_TX_DONE
+        mock_lora.transmitTime.side_effect = RuntimeError("no stats")
+        radio._finalize_transmission()  # must not raise
+
+    async def test_wait_for_rx_is_not_implemented(self, radio):
+        with pytest.raises(NotImplementedError):
+            await radio.wait_for_rx()
+
+    def test_sleep_and_metric_getters(self, radio, mock_lora):
+        radio.last_rssi = -77
+        radio.last_snr = 4.5
+        radio.last_signal_rssi = -79
+        radio.sleep()
+        mock_lora.sleep.assert_called_once()
+        assert radio.get_last_rssi() == -77
+        assert radio.get_last_snr() == pytest.approx(4.5)
+        assert radio.get_last_signal_rssi() == -79
+
+    def test_sleep_driver_exception_is_swallowed(self, radio, mock_lora):
+        mock_lora.sleep.side_effect = RuntimeError("sleep failed")
+        radio.sleep()  # must not raise
+
+    def test_get_noise_floor_returns_zero_while_tx_lock_held(self, radio):
+        radio._tx_lock = MagicMock()
+        radio._tx_lock.locked.return_value = True
+        assert radio.get_noise_floor() == 0.0
+
+    def test_noise_floor_sampling_handles_rssi_read_exception(self, radio, mock_lora):
+        radio._last_packet_activity = 0.0
+        radio._is_receiving_packet = False
+        mock_lora.getRssiInst.side_effect = RuntimeError("rssi error")
+        radio._sample_noise_floor()  # must not raise
+
+    async def test_perform_cad_raises_when_not_initialized(self, radio):
+        radio._initialized = False
+        with pytest.raises(RuntimeError, match="Radio not initialized"):
+            await radio.perform_cad(timeout=0.1)
+
+    async def test_perform_cad_raises_when_lora_missing(self, radio):
+        radio.lora = None
+        with pytest.raises(RuntimeError, match="LoRa radio object not available"):
+            await radio.perform_cad(timeout=0.1)
+
+    async def test_perform_cad_clears_existing_irq_before_operation(self, radio, mock_lora):
+        async def _fire_event():
+            await asyncio.sleep(0.01)
+            radio._last_cad_irq_status = IRQ_CAD_DONE
+            radio._last_cad_detected = False
+            radio._cad_event.set()
+
+        mock_lora.getIrqStatus.side_effect = [0x0010, 0x0000]
+        asyncio.get_running_loop().create_task(_fire_event())
+        result = await radio.perform_cad(timeout=1.0)
+        assert result is False
+        assert any(c.args == (0x0010,) for c in mock_lora.clearIrqStatus.call_args_list)
+
+    async def test_perform_cad_warns_when_irq_pin_stays_high(self, radio, mock_lora, caplog):
+        import logging
+
+        radio._gpio_manager.read_pin.return_value = True
+        mock_lora.getIrqStatus.return_value = 0
+        with caplog.at_level(logging.WARNING, logger="SX1262_wrapper"):
+            await radio.perform_cad(timeout=0.05)
+        assert any("IRQ pin stuck HIGH" in r.message for r in caplog.records)
+
+    async def test_perform_cad_success_clears_nonzero_current_irq(self, radio, mock_lora):
+        async def _fire_event():
+            await asyncio.sleep(0.01)
+            radio._last_cad_irq_status = IRQ_CAD_DONE
+            radio._last_cad_detected = True
+            radio._cad_event.set()
+
+        # existing_irq=0, current_irq(after completion)=0x0020
+        mock_lora.getIrqStatus.side_effect = [0, 0x0020]
+        asyncio.get_running_loop().create_task(_fire_event())
+        assert await radio.perform_cad(timeout=1.0) is True
+        assert any(c.args == (0x0020,) for c in mock_lora.clearIrqStatus.call_args_list)
+
+    async def test_perform_cad_timeout_clears_nonzero_irq(self, radio, mock_lora):
+        # existing_irq=0, timeout irq check=0x0040
+        mock_lora.getIrqStatus.side_effect = [0, 0x0040]
+        result = await radio.perform_cad(timeout=0.05)
+        assert result is False
+        assert any(c.args == (0x0040,) for c in mock_lora.clearIrqStatus.call_args_list)
+
+    def test_cleanup_handles_rx_task_done_check_exception(self, radio):
+        bad_task = MagicMock()
+        bad_task.done.side_effect = RuntimeError("task state failed")
+        radio._rx_irq_task = bad_task
+        radio.cleanup()  # must not raise
+
+
+class TestBeginBranchCoverage:
+    def test_begin_sets_manual_cs_pin_when_configured(self, mock_lora, mock_gpio):
+        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+
+        with (
+            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+        ):
+            radio = SX1262Radio(cs_pin=21, radio_timing_delay=0.0)
+            assert radio.begin() is True
+
+        mock_lora.setManualCsPin.assert_called_once_with(21)
+
+    def test_begin_logs_warnings_for_output_pin_setup_failures(self, mock_lora, mock_gpio, caplog):
+        import logging
+        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+
+        failing_pins = {6, 26, 23, 24, 30}
+
+        def _setup_output_pin(pin, initial_value=False):
+            return pin not in failing_pins
+
+        mock_gpio.setup_output_pin.side_effect = _setup_output_pin
+
+        with (
+            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            caplog.at_level(logging.WARNING, logger="SX1262_wrapper"),
+        ):
+            radio = SX1262Radio(
+                txen_pin=6,
+                rxen_pin=26,
+                txled_pin=23,
+                rxled_pin=24,
+                en_pins=[30],
+                radio_timing_delay=0.0,
+            )
+            assert radio.begin() is True
+
+        expected = [
+            "Could not setup TXEN pin",
+            "Could not setup RXEN pin",
+            "Could not setup TX LED pin",
+            "Could not setup RX LED pin",
+            "Could not setup EN pin",
+        ]
+        for msg in expected:
+            assert any(msg in r.message for r in caplog.records)
+
+    def test_begin_maps_invalid_tcxo_voltage_to_closest_value(self, mock_lora, mock_gpio):
+        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+
+        with (
+            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+        ):
+            radio = SX1262Radio(use_dio3_tcxo=True, dio3_tcxo_voltage=2.6, radio_timing_delay=0.0)
+            assert radio.begin() is True
+
+        mock_lora.setDio3TcxoCtrl.assert_called_once_with(mock_lora.DIO3_OUTPUT_2_7, mock_lora.TCXO_DELAY_5)
+
+    def test_begin_custom_cad_threshold_write_failure_is_non_fatal(self, mock_lora, mock_gpio, caplog):
+        import logging
+        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+
+        mock_lora.setCadParams.side_effect = RuntimeError("cad params failed")
+
+        with (
+            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            caplog.at_level(logging.WARNING, logger="SX1262_wrapper"),
+        ):
+            radio = SX1262Radio(radio_timing_delay=0.0)
+            radio._custom_cad_peak = 12
+            radio._custom_cad_min = 4
+            assert radio.begin() is True
+
+        assert any("Failed to write CAD thresholds" in r.message for r in caplog.records)
+
+    def test_begin_custom_cad_threshold_write_success(self, mock_lora, mock_gpio):
+        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+
+        with (
+            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+        ):
+            radio = SX1262Radio(radio_timing_delay=0.0)
+            radio._custom_cad_peak = 12
+            radio._custom_cad_min = 4
+            assert radio.begin() is True
+
+        # One call from begin() custom-threshold programming path.
+        assert mock_lora.setCadParams.call_count >= 1
+
+    def test_begin_polling_start_exception_is_non_fatal(self, mock_lora, mock_gpio, caplog):
+        import logging
+        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+
+        irq_pin_obj = MagicMock()
+        irq_pin_obj.start_polling.side_effect = RuntimeError("poll failed")
+        mock_gpio._pins = {16: irq_pin_obj}
+
+        with (
+            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            caplog.at_level(logging.WARNING, logger="SX1262_wrapper"),
+        ):
+            radio = SX1262Radio(radio_timing_delay=0.0)
+            assert radio.begin() is True
+
+        assert any("Failed to start IRQ polling" in r.message for r in caplog.records)
+
+    def test_begin_returns_true_without_running_loop_for_rx_task_start(self, mock_lora, mock_gpio):
+        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+
+        with (
+            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+        ):
+            radio = SX1262Radio(radio_timing_delay=0.0)
+            assert radio.begin() is True
+            assert not hasattr(radio, "_rx_irq_task")
+
+    async def test_begin_uses_already_running_rx_irq_task(self, mock_lora, mock_gpio):
+        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+
+        existing_task = MagicMock()
+        existing_task.done.return_value = False
+
+        with (
+            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+        ):
+            radio = SX1262Radio(radio_timing_delay=0.0)
+            radio._rx_irq_task = existing_task
+            assert radio.begin() is True
+
+        assert radio._rx_irq_task is existing_task
+
+    async def test_begin_rx_task_start_exception_is_non_fatal(self, mock_lora, mock_gpio, caplog):
+        import logging
+        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+
+        with (
+            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            patch("pymc_core.hardware.sx1262_wrapper.asyncio.get_running_loop", side_effect=ValueError("loop boom")),
+            caplog.at_level(logging.WARNING, logger="SX1262_wrapper"),
+        ):
+            radio = SX1262Radio(radio_timing_delay=0.0)
+            assert radio.begin() is True
+
+        assert any("Failed to start RX IRQ background handler" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "freq,cal_min,cal_max",
+        [
+            (433_000_000, "CAL_IMG_430", "CAL_IMG_440"),
+            (500_000_000, "CAL_IMG_470", "CAL_IMG_510"),
+            (800_000_000, "CAL_IMG_779", "CAL_IMG_787"),
+            (868_000_000, "CAL_IMG_863", "CAL_IMG_870"),
+        ],
+    )
+    def test_begin_frequency_band_calibration_paths(self, mock_lora, mock_gpio, freq, cal_min, cal_max):
+        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+
+        with (
+            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+        ):
+            radio = SX1262Radio(frequency=freq, radio_timing_delay=0.0)
+            assert radio.begin() is True
+
+        mock_lora.calibrateImage.assert_called_with(getattr(mock_lora, cal_min), getattr(mock_lora, cal_max))
+
+
+class TestFactoryAndSingletonPaths:
+    def test_get_instance_constructs_when_singleton_missing(self, mock_gpio):
+        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+
+        SX1262Radio._active_instance = None
+        with (
+            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+        ):
+            instance = SX1262Radio.get_instance(radio_timing_delay=0.0)
+
+        assert isinstance(instance, SX1262Radio)
+
+    def test_create_sx1262_radio_returns_instance_on_success(self):
+        from pymc_core.hardware import sx1262_wrapper as module
+
+        fake_radio = MagicMock()
+        fake_radio.begin.return_value = True
+
+        with patch.object(module, "SX1262Radio", return_value=fake_radio):
+            created = module.create_sx1262_radio(test=True)
+
+        assert created is fake_radio
+
+    def test_create_sx1262_radio_raises_when_begin_fails(self):
+        from pymc_core.hardware import sx1262_wrapper as module
+
+        fake_radio = MagicMock()
+        fake_radio.begin.return_value = False
+
+        with patch.object(module, "SX1262Radio", return_value=fake_radio):
+            with pytest.raises(RuntimeError, match="Failed to initialize SX1262 radio"):
+                module.create_sx1262_radio(test=True)
+
+
+class TestCoverageSecondPass:
+    def test_trampoline_clears_loop_on_closed_runtime_error(self, radio):
+        radio._event_loop = MagicMock()
+        radio._event_loop.call_soon_threadsafe.side_effect = RuntimeError("Event loop is closed")
+        radio._irq_trampoline()
+        assert radio._event_loop is None
+
+    def test_basic_radio_setup_fails_when_mode_mismatch_without_busy_check(self, radio, mock_lora):
+        mock_lora.getMode.return_value = 999
+        assert radio._basic_radio_setup(use_busy_check=False) is False
+
+    def test_set_rx_callback_no_running_loop_logs_debug(self, radio, caplog):
+        import logging
+
+        radio._rx_irq_task = None
+        with caplog.at_level(logging.DEBUG, logger="SX1262_wrapper"):
+            radio.set_rx_callback(lambda _pkt: None)
+        assert any("No event loop available for RX task startup" in r.message for r in caplog.records)
+
+    async def test_set_rx_callback_running_loop_error_logs_warning(self, radio, caplog):
+        import logging
+
+        radio._rx_irq_task = None
+        with (
+            patch("pymc_core.hardware.sx1262_wrapper.asyncio.get_running_loop", side_effect=ValueError("boom")),
+            caplog.at_level(logging.WARNING, logger="SX1262_wrapper"),
+        ):
+            radio.set_rx_callback(lambda _pkt: None)
+        assert any("Failed to start delayed RX IRQ background handler" in r.message for r in caplog.records)
+
+    async def test_rx_crc_diag_readbuffer_failure_logs_read_failed(self, radio, caplog):
+        import logging
+
+        radio.lora.getRxBufferStatus.return_value = (4, 0x80)
+        radio.lora.readBuffer.side_effect = RuntimeError("read fail")
+        task = asyncio.get_running_loop().create_task(radio._rx_irq_background_task())
+        radio._last_irq_status = IRQ_CRC_ERR
+        with caplog.at_level(logging.WARNING, logger="SX1262_wrapper"):
+            radio._rx_done_event.set()
+            await asyncio.sleep(0.05)
+        radio._initialized = False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert any("RawData=(read failed)" in r.message for r in caplog.records)
+
+    async def test_rx_crc_diag_collection_failure_uses_fallback_warning(self, radio, caplog):
+        import logging
+
+        radio.lora.getSignalMetrics.side_effect = RuntimeError("diag fail")
+        task = asyncio.get_running_loop().create_task(radio._rx_irq_background_task())
+        radio._last_irq_status = IRQ_CRC_ERR
+        with caplog.at_level(logging.WARNING, logger="SX1262_wrapper"):
+            radio._rx_done_event.set()
+            await asyncio.sleep(0.05)
+        radio._initialized = False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert any("Unable to collect diagnostics" in r.message for r in caplog.records)
+
+    async def test_rx_no_callback_warning_path(self, radio, caplog):
+        import logging
+
+        radio.rx_callback = None
+        task = asyncio.get_running_loop().create_task(radio._rx_irq_background_task())
+        radio._last_irq_status = IRQ_RX_DONE
+        with caplog.at_level(logging.WARNING, logger="SX1262_wrapper"):
+            radio._rx_done_event.set()
+            await asyncio.sleep(0.05)
+        radio._initialized = False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert any("No RX callback registered" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize("irq", [IRQ_PREAMBLE_DETECTED, IRQ_SYNC_WORD_VALID, IRQ_HEADER_VALID, 0x0000])
+    async def test_rx_progress_and_other_irq_paths(self, radio, irq):
+        task = asyncio.get_running_loop().create_task(radio._rx_irq_background_task())
+        radio._last_irq_status = irq
+        radio._rx_done_event.set()
+        await asyncio.sleep(0.05)
+        radio._initialized = False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def test_rx_restore_mode_failure_logs_error(self, radio, caplog):
+        import logging
+
+        radio.lora.request.side_effect = RuntimeError("restore fail")
+        task = asyncio.get_running_loop().create_task(radio._rx_irq_background_task())
+        radio._last_irq_status = IRQ_TIMEOUT
+        with caplog.at_level(logging.ERROR, logger="SX1262_wrapper"):
+            radio._rx_done_event.set()
+            await asyncio.sleep(0.05)
+        radio._initialized = False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert any("Failed to restore RX mode" in r.message for r in caplog.records)
+
+    async def test_rx_restore_skipped_when_tx_lock_held(self, radio, caplog):
+        import logging
+
+        task = asyncio.get_running_loop().create_task(radio._rx_irq_background_task())
+        async with radio._tx_lock:
+            radio._last_irq_status = IRQ_TIMEOUT
+            with caplog.at_level(logging.DEBUG, logger="SX1262_wrapper"):
+                radio._rx_done_event.set()
+                await asyncio.sleep(0.05)
+        radio._initialized = False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert any("Skipped RX restore" in r.message for r in caplog.records)
+
+    async def test_rx_packet_processing_exception_logged(self, radio, caplog):
+        import logging
+
+        radio.lora.getRxBufferStatus.side_effect = RuntimeError("rx status fail")
+        task = asyncio.get_running_loop().create_task(radio._rx_irq_background_task())
+        radio._last_irq_status = IRQ_RX_DONE
+        with caplog.at_level(logging.ERROR, logger="SX1262_wrapper"):
+            radio._rx_done_event.set()
+            await asyncio.sleep(0.05)
+        radio._initialized = False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert any("Error processing received packet" in r.message for r in caplog.records)
+
+    async def test_rx_task_logs_periodic_status_every_500_timeouts(self, radio):
+        calls = {"n": 0}
+
+        def _sample_and_stop():
+            calls["n"] += 1
+            if calls["n"] >= 500:
+                radio._initialized = False
+
+        radio.RADIO_TIMING_DELAY = 0.0
+        radio._sample_noise_floor = _sample_and_stop
+        await radio._rx_irq_background_task()
+        assert calls["n"] >= 500
+
+    async def test_rx_task_interrupt_disabled_branch(self, radio):
+        radio._interrupt_setup = False
+
+        async def _stop_soon():
+            await asyncio.sleep(0.02)
+            radio._initialized = False
+
+        asyncio.get_running_loop().create_task(_stop_soon())
+        await radio._rx_irq_background_task()
+        assert radio._initialized is False
+
+    async def test_rx_task_unexpected_error_branch(self, radio):
+        original_wait_for = asyncio.wait_for
+
+        async def _boom_wait_for(*args, **kwargs):
+            # If wait_for is mocked to raise immediately, close the coroutine
+            # argument to avoid "coroutine was never awaited" warnings.
+            if args and asyncio.iscoroutine(args[0]):
+                args[0].close()
+            raise RuntimeError("wait boom")
+
+        async def _fast_sleep(_delay):
+            radio._initialized = False
+
+        with (
+            patch("pymc_core.hardware.sx1262_wrapper.asyncio.wait_for", side_effect=_boom_wait_for),
+            patch("pymc_core.hardware.sx1262_wrapper.asyncio.sleep", side_effect=_fast_sleep),
+        ):
+            await radio._rx_irq_background_task()
+
+        # Keep reference to avoid lint complaints about shadowing in older runners.
+        assert original_wait_for is not None
+
+    def test_check_radio_health_uninitialized_returns_false(self, radio):
+        radio._initialized = False
+        assert radio.check_radio_health() is False
+
+    async def test_check_radio_health_restarts_dead_task(self, radio):
+        radio._rx_irq_task = MagicMock()
+        radio._rx_irq_task.done.return_value = True
+        assert radio.check_radio_health() is False
+        assert hasattr(radio, "_rx_irq_task")
+        if isinstance(radio._rx_irq_task, asyncio.Task):
+            radio._initialized = False
+            radio._rx_irq_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await radio._rx_irq_task
+
+    def test_check_radio_health_true_when_task_alive(self, radio):
+        alive_task = MagicMock()
+        alive_task.done.return_value = False
+        radio._rx_irq_task = alive_task
+        assert radio.check_radio_health() is True
+
+    def test_begin_covers_success_pin_setup_paths_and_info_logs(self, mock_lora, mock_gpio, caplog):
+        import logging
+        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+
+        irq_pin_obj = MagicMock()
+        irq_pin_obj.start_polling = MagicMock()
+        mock_gpio._pins = {16: irq_pin_obj}
+
+        with (
+            patch("pymc_core.hardware.sx1262_wrapper.SX126x", return_value=mock_lora),
+            patch("pymc_core.hardware.sx1262_wrapper.GPIOPinManager", return_value=mock_gpio),
+            patch("pymc_core.hardware.sx1262_wrapper.set_gpio_manager"),
+            caplog.at_level(logging.INFO, logger="SX1262_wrapper"),
+        ):
+            radio = SX1262Radio(
+                txen_pin=6,
+                rxen_pin=26,
+                txled_pin=23,
+                rxled_pin=24,
+                en_pins=[30],
+                use_dio3_tcxo=True,
+                dio3_tcxo_voltage=1.8,
+                use_dio2_rf=True,
+                radio_timing_delay=0.0,
+            )
+            assert radio.begin() is True
+
+        assert radio._txled_pin_setup is True
+        assert radio._rxled_pin_setup is True
+        assert radio._en_pins_setup is True
+        assert any("DIO2 RF switch control enabled" in r.message for r in caplog.records)
+        assert any("Started IRQ polling after radio init" in r.message for r in caplog.records)
+
+    def test_calculate_tx_timeout_covers_non_positive_tmp_branch(self, radio):
+        radio.spreading_factor = 12
+        timeout_ms, driver_timeout = radio._calculate_tx_timeout(0)
+        assert timeout_ms > 0
+        assert driver_timeout == timeout_ms * 64
+
+    async def test_send_raises_when_execute_transmission_returns_false(self, radio):
+        radio.perform_cad = AsyncMock(return_value=False)
+        radio._execute_transmission = AsyncMock(return_value=False)
+        with pytest.raises(RuntimeError, match="Radio failed to start TX"):
+            await radio.send(b"data")
+
+    def test_noise_floor_rejects_sample_above_threshold(self, radio, mock_lora):
+        radio._noise_floor = -100.0
+        radio._last_packet_activity = 0.0
+        radio._is_receiving_packet = False
+        before = radio._num_floor_samples
+        # -50 dBm is above threshold (-90), should be rejected.
+        mock_lora.getRssiInst.return_value = 100
+        radio._sample_noise_floor()
+        assert radio._num_floor_samples == before
+
+    def test_cleanup_cancels_not_done_rx_task(self, radio):
+        task = MagicMock()
+        task.done.return_value = False
+        radio._rx_irq_task = task
+        radio.cleanup()
+        task.cancel.assert_called_once()
