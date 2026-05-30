@@ -14,6 +14,7 @@ import logging
 import random
 import struct
 import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, Optional, Union
@@ -230,6 +231,10 @@ class KissModemWrapper(LoRaRadio):
         radio_config: Optional[Dict[str, Any]] = None,
         auto_configure: bool = True,
         lbt_enabled: bool = False,
+        connect_retries: int = 3,
+        post_open_delay_ms: int = 500,
+        usb_reset_on_connect: Optional[bool] = None,
+        startup_retry_budget_sec: float = 5.0,
     ):
         """
         Initialize MeshCore KISS Modem Wrapper
@@ -259,6 +264,14 @@ class KissModemWrapper(LoRaRadio):
         self.timeout = timeout
         self.auto_configure = auto_configure
         self.lbt_enabled = lbt_enabled
+        self.connect_retries = max(1, int(connect_retries))
+        self.post_open_delay_ms = max(0, int(post_open_delay_ms))
+        self.startup_retry_budget_sec = max(1.0, float(startup_retry_budget_sec))
+        if usb_reset_on_connect is None:
+            self.usb_reset_on_connect = str(port).startswith("/dev/serial/by-id/")
+        else:
+            self.usb_reset_on_connect = bool(usb_reset_on_connect)
+        self._shutting_down = False
 
         self.radio_config = radio_config or {}
         self.is_configured = False
@@ -362,6 +375,7 @@ class KissModemWrapper(LoRaRadio):
             True if connection successful, False otherwise
         """
         try:
+            self._shutting_down = False
             self.serial_conn = serial.Serial(
                 port=self.port,
                 baudrate=self.baudrate,
@@ -383,10 +397,16 @@ class KissModemWrapper(LoRaRadio):
 
             logger.info(f"KISS modem connected to {self.port} at {self.baudrate} baud")
 
+            if not self._wait_for_modem_ready():
+                logger.warning("KISS modem did not become ready after reconnect")
+                self.disconnect()
+                return False
+
             # Auto-configure if requested
             if self.auto_configure and self.radio_config:
-                if not self.configure_radio():
-                    logger.warning("Auto-configuration failed")
+                if not self._configure_radio_with_retries():
+                    logger.warning("Auto-configuration failed after retries")
+                    self.disconnect()
                     return False
 
             # Query modem info
@@ -409,7 +429,7 @@ class KissModemWrapper(LoRaRadio):
 
         except Exception as e:
             logger.error(f"Failed to connect to {self.port}: {e}")
-            self.is_connected = False
+            self.disconnect()
             return False
 
     def disconnect(self):
@@ -432,6 +452,78 @@ class KissModemWrapper(LoRaRadio):
             self.serial_conn.close()
 
         logger.info(f"KISS modem disconnected from {self.port}")
+
+    def cleanup(self) -> None:
+        """Release resources and abort any in-flight blocking waits."""
+        self._shutting_down = True
+        self._response_event.set()
+        self._tx_done_event.set()
+        self.disconnect()
+
+    def _wait_for_modem_ready(self) -> bool:
+        """
+        Perform serial resync and readiness probing after opening the port.
+        """
+        if not self.serial_conn:
+            return False
+
+        if self.post_open_delay_ms > 0:
+            threading.Event().wait(self.post_open_delay_ms / 1000.0)
+
+        try:
+            self.serial_conn.reset_input_buffer()
+            self.serial_conn.reset_output_buffer()
+        except Exception as e:
+            logger.debug("Serial buffer reset skipped/failed: %s", e)
+
+        if self.usb_reset_on_connect and hasattr(self.serial_conn, "dtr"):
+            try:
+                self.serial_conn.dtr = False
+                threading.Event().wait(0.1)
+                self.serial_conn.dtr = True
+            except Exception as e:
+                logger.debug("USB DTR toggle skipped/failed: %s", e)
+
+        try:
+            self.serial_conn.write(bytes([KISS_FEND]))
+            self.serial_conn.flush()
+        except Exception as e:
+            logger.debug("KISS parser resync write failed: %s", e)
+
+        backoff_seconds = [0.5, 1.0, 2.0, 2.0, 2.0]
+        deadline = time.monotonic() + self.startup_retry_budget_sec
+
+        for attempt in range(self.connect_retries):
+            if self._shutting_down:
+                return False
+            resp = self._send_command(CMD_PING, timeout=1.0)
+            if resp and resp[0] == RESP_PONG:
+                logger.debug("KISS modem responded to ping on attempt %d", attempt + 1)
+                return True
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            delay = min(backoff_seconds[min(attempt, len(backoff_seconds) - 1)], remaining)
+            threading.Event().wait(delay)
+
+        return False
+
+    def _configure_radio_with_retries(self) -> bool:
+        """Attempt auto-configuration with bounded retries/backoff."""
+        deadline = time.monotonic() + self.startup_retry_budget_sec
+        backoff_seconds = [0.5, 1.0, 2.0, 2.0, 2.0]
+        for attempt in range(self.connect_retries):
+            if self._shutting_down:
+                return False
+            if self.configure_radio():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            delay = min(backoff_seconds[min(attempt, len(backoff_seconds) - 1)], remaining)
+            threading.Event().wait(delay)
+        return False
 
     def _write_frame(self, frame: bytes) -> bool:
         """
@@ -734,6 +826,9 @@ class KissModemWrapper(LoRaRadio):
         Returns:
             Tuple of (response_sub_cmd, response_data) or None on timeout
         """
+        if self._shutting_down:
+            return None
+
         with self._response_lock:
             self._response_event.clear()
             self._pending_response = None
@@ -746,12 +841,20 @@ class KissModemWrapper(LoRaRadio):
             return None
 
         # Wait for response
-        if self._response_event.wait(timeout):
-            with self._response_lock:
-                return self._pending_response
-        else:
-            logger.warning(f"SetHardware sub_cmd 0x{sub_cmd:02X} timeout")
+        deadline = time.monotonic() + timeout
+        while not self._shutting_down:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if self._response_event.wait(min(0.1, remaining)):
+                with self._response_lock:
+                    return self._pending_response
+
+        if self._shutting_down:
             return None
+
+        logger.warning(f"SetHardware sub_cmd 0x{sub_cmd:02X} timeout")
+        return None
 
     def get_radio_config(self) -> Optional[Dict[str, Any]]:
         """
@@ -1493,6 +1596,6 @@ class KissModemWrapper(LoRaRadio):
     def __del__(self):
         """Destructor to ensure cleanup"""
         try:
-            self.disconnect()
+            self.cleanup()
         except Exception:
             pass

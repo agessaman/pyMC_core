@@ -1027,3 +1027,64 @@ class TestAsyncSendTxDone:
 
         with pytest.raises(Exception, match="TX_DONE"):
             await modem.send(b"\x01\x02\x03\x04")
+
+
+class TestShutdownAndConnectResilience:
+    def test_cleanup_sets_abort_flags_and_disconnects(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._response_event.clear()
+        modem._tx_done_event.clear()
+
+        with patch.object(modem, "disconnect") as mock_disconnect:
+            modem.cleanup()
+
+        assert modem._shutting_down is True
+        assert modem._response_event.is_set() is True
+        assert modem._tx_done_event.is_set() is True
+        mock_disconnect.assert_called_once()
+
+    def test_send_command_returns_none_while_shutting_down(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._shutting_down = True
+        assert modem._send_command(CMD_GET_VERSION, timeout=0.1) is None
+
+    def test_wait_for_modem_ready_retries_until_pong(self):
+        modem = KissModemWrapper(
+            port="/dev/serial/by-id/test",
+            auto_configure=False,
+            connect_retries=3,
+            post_open_delay_ms=0,
+            startup_retry_budget_sec=30.0,
+        )
+        serial_conn = MagicMock()
+        serial_conn.is_open = True
+        modem.serial_conn = serial_conn
+
+        responses = [None, None, (RESP_PONG, b"")]
+
+        def _fake_send_command(_cmd, data=b"", timeout=1.0):
+            return responses.pop(0)
+
+        modem._send_command = _fake_send_command
+
+        with patch("threading.Event.wait", return_value=None):
+            assert modem._wait_for_modem_ready() is True
+
+        assert modem.serial_conn.write.called
+        assert modem.serial_conn.flush.called
+
+    def test_configure_radio_with_retries_eventually_succeeds(self):
+        modem = KissModemWrapper(
+            port="/dev/null",
+            auto_configure=False,
+            connect_retries=3,
+            startup_retry_budget_sec=30.0,
+        )
+
+        with (
+            patch.object(modem, "configure_radio", side_effect=[False, False, True]) as mock_cfg,
+            patch("threading.Event.wait", return_value=None),
+        ):
+            assert modem._configure_radio_with_retries() is True
+
+        assert mock_cfg.call_count == 3
