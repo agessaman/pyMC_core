@@ -270,6 +270,34 @@ class TestCompanionBridgeSendAndShare:
         assert bytes(pkt.payload) == payload
         assert wait_for_ack is False
 
+    async def test_send_raw_packet_parses_and_injects(self):
+        """send_raw_packet parses on-air bytes into a Packet and sends them verbatim."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        await bridge.start()
+        # Build a real on-air packet and serialize it to wire bytes.
+        source = PacketBuilder.create_raw_data(b"\x01\x02\x03\x04")
+        raw_bytes = source.write_to()
+        result = await bridge.send_raw_packet(0, raw_bytes)
+        await bridge.stop()
+        assert result is True
+        assert len(injector.calls) == 1
+        pkt, wait_for_ack = injector.calls[0]
+        # The injected packet round-trips the original wire bytes.
+        assert pkt.write_to() == raw_bytes
+        assert wait_for_ack is False
+
+    async def test_send_raw_packet_unparseable_returns_false(self):
+        """send_raw_packet returns False (no injection) when bytes don't parse."""
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        await bridge.start()
+        # Header byte only: read_from has no path_len/payload to parse -> failure.
+        result = await bridge.send_raw_packet(0, b"\x00")
+        await bridge.stop()
+        assert result is False
+        assert injector.calls == []
+
 
 # ---------------------------------------------------------------------------
 # Path discovery, trace, control data

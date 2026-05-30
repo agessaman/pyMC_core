@@ -1452,6 +1452,43 @@ class CompanionBase(ABC):
             logger.error(f"Error sending raw data direct: {e}")
             return SentResult(success=False)
 
+    async def send_raw_packet(self, priority: int, packet_bytes: bytes) -> bool:
+        """Inject a fully-formed on-air packet for transmission (CMD_SEND_RAW_PACKET).
+
+        Mirrors firmware ``MyMesh.cpp`` ``CMD_SEND_RAW_PACKET``: parse the raw
+        on-air bytes into a :class:`Packet` (``tryParsePacket``) and enqueue it
+        for TX (``sendPacket``).  ``packet_bytes`` is the complete wire packet
+        (header, optional transport codes, path, payload) as produced by
+        :meth:`Packet.write_to`; it is sent verbatim, with no encryption,
+        contact lookup, flood-scope, or path-hash-mode rewriting.
+
+        The ``priority`` argument is accepted for protocol compatibility but is
+        currently ignored: the bridge's low-level send path
+        (:meth:`_send_packet`) does not expose a prioritized TX queue.
+
+        Returns True if the packet parsed and was handed off for transmission,
+        False on parse failure or send error (the frame_server handler maps
+        False to ``ERR_CODE_TABLE_FULL``).
+        """
+        try:
+            pkt = Packet()
+            if not pkt.read_from(bytes(packet_bytes)):
+                return False
+        except Exception as e:
+            logger.warning(f"send_raw_packet: failed to parse packet: {e}")
+            return False
+        try:
+            success = await self._send_packet(pkt, wait_for_ack=False)
+            if success:
+                self.stats.record_tx(is_flood=False)
+            else:
+                self.stats.record_tx_error()
+            return success
+        except Exception as e:
+            logger.error(f"Error sending raw packet: {e}")
+            self.stats.record_tx_error()
+            return False
+
     async def send_trace_path(
         self,
         pub_key: bytes,
