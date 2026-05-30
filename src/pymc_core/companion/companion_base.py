@@ -1148,13 +1148,16 @@ class CompanionBase(ABC):
             return SentResult(success=False)
         request_type = PROTOCOL_CODE_ANON_REQ
         req_payload = data  # no random tag; timestamp provides uniqueness
+        # The first byte is the ANON_REQ_TYPE_* sub-type (e.g. REGIONS/OWNER);
+        # record it so the response can be parsed by sub-type rather than being
+        # mistaken for a binary REQ_TYPE_GET_OWNER_INFO (both use code 0x07).
+        anon_sub_type = req_payload[0] if len(req_payload) >= 1 else None
         self.cleanup_expired_binary_requests()
         try:
-            pkt, timestamp = PacketBuilder.create_protocol_request(
+            pkt, timestamp = PacketBuilder.create_anon_request(
                 contact=proxy,
                 local_identity=self._identity,
-                protocol_code=PROTOCOL_CODE_ANON_REQ,
-                data=req_payload,
+                req_data=req_payload,
             )
             # Use the timestamp as the tag — matches what the repeater echoes back
             tag_int = timestamp
@@ -1165,6 +1168,7 @@ class CompanionBase(ABC):
                 request_type=request_type,
                 timeout_seconds=timeout_seconds,
                 pubkey_prefix=pub_key[:6].hex(),
+                context={"anon_sub_type": anon_sub_type},
             )
             self._apply_flood_scope(pkt)
             self._apply_path_hash_mode(pkt)
@@ -1179,7 +1183,9 @@ class CompanionBase(ABC):
             return SentResult(success=False)
         return SentResult(
             success=True,
-            is_flood=contact.out_path_len <= 0,
+            # Direct (incl. zero-hop, out_path_len == 0) when the path is known;
+            # flood only when the out_path is unknown (-1). Mirrors create_anon_request.
+            is_flood=contact.out_path_len < 0,
             expected_ack=tag_int,
             timeout_ms=DEFAULT_RESPONSE_TIMEOUT_MS,
         )
@@ -1993,7 +1999,9 @@ class CompanionBase(ABC):
             else:
                 secret = secret[:32]
             try:
-                plaintext = CryptoUtils.mac_then_decrypt(hashlib.sha256(secret).digest(), secret, cipher_mac + ciphertext)
+                plaintext = CryptoUtils.mac_then_decrypt(
+                    hashlib.sha256(secret).digest(), secret, cipher_mac + ciphertext
+                )
             except Exception:
                 plaintext = None
             if plaintext is not None:
@@ -2009,7 +2017,11 @@ class CompanionBase(ABC):
         blob = bytes(plaintext[3 : 3 + data_len])
 
         route_type = packet.get_route_type()
-        path_len = packet.path_len if route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD) else 0xFF
+        path_len = (
+            packet.path_len
+            if route_type in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD)
+            else 0xFF
+        )
         snr = packet.get_snr() if hasattr(packet, "get_snr") else getattr(packet, "_snr", 0.0)
         rssi = packet.rssi if hasattr(packet, "rssi") else getattr(packet, "_rssi", 0)
         queued = QueuedMessage(

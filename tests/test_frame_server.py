@@ -16,12 +16,13 @@ from pymc_core.companion.constants import (
     PUB_KEY_SIZE,
     PUSH_CODE_ADVERT,
     PUSH_CODE_NEW_ADVERT,
+    RESP_CODE_ALLOWED_REPEAT_FREQ,
     RESP_CODE_CHANNEL_DATA_RECV,
     RESP_CODE_DEFAULT_FLOOD_SCOPE,
     RESP_CODE_OK,
 )
 from pymc_core.companion.frame_server import CompanionFrameServer, _build_advert_push_frames
-from pymc_core.companion.models import Contact, NodePrefs, QueuedMessage, SentResult
+from pymc_core.companion.models import Contact, QueuedMessage, SentResult
 
 
 def test_build_advert_push_frames_short_only_when_no_name():
@@ -137,7 +138,9 @@ class _MockBridgeChannelData:
     def get_channel(self, idx: int):
         return self._channel if idx == 1 else None
 
-    async def send_channel_data(self, channel_idx, data_type, payload, *, path=None, path_len_encoded=None):
+    async def send_channel_data(
+        self, channel_idx, data_type, payload, *, path=None, path_len_encoded=None
+    ):
         self.calls.append((channel_idx, data_type, payload, path, path_len_encoded))
         return self._send_ok
 
@@ -181,7 +184,7 @@ async def test_cmd_send_channel_data_valid_direct_path():
     server._write_err = Mock()
 
     path_len = PathUtils.encode_path_len(1, 2)  # two 1-byte hops
-    payload = b"\xDE\xAD\xBE"
+    payload = b"\xde\xad\xbe"
     data = bytes([1, path_len, 0x10, 0x20, 0x34, 0x12]) + payload
     await server._cmd_send_channel_data(data)
 
@@ -294,7 +297,7 @@ async def test_cmd_send_raw_data_2byte_hashes():
     # path_len_encoded=0x42 → 2-byte hashes, 2 hops → 4 bytes of path
     path_len_byte = PathUtils.encode_path_len(2, 2)  # 0x42
     path_data = b"\x01\x02\x03\x04"
-    payload_data = b"\xAA\xBB\xCC\xDD"
+    payload_data = b"\xaa\xbb\xcc\xdd"
     data = bytes([path_len_byte]) + path_data + payload_data
     await server._cmd_send_raw_data(data)
     assert len(bridge.calls) == 1
@@ -383,7 +386,7 @@ def test_build_message_frame_channel_data_v15():
         snr=2.0,
         rssi=-90,
         channel_data_type=0x1234,
-        channel_data_payload=b"\xAA\xBB",
+        channel_data_payload=b"\xaa\xbb",
     )
     frame = server._build_message_frame(msg)
     assert frame[0] == RESP_CODE_CHANNEL_DATA_RECV
@@ -391,7 +394,7 @@ def test_build_message_frame_channel_data_v15():
     assert frame[5] == 0xFF
     assert frame[6:8] == b"\x34\x12"
     assert frame[8] == 2
-    assert frame[9:11] == b"\xAA\xBB"
+    assert frame[9:11] == b"\xaa\xbb"
 
 
 @pytest.mark.asyncio
@@ -826,3 +829,84 @@ async def test_handle_client_connection_reset_disconnects_cleanly(caplog):
     assert server._client_reader is None
     assert server._writer_task is None
     assert any("ConnectionResetError" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_cmd_get_allowed_repeat_freq_empty_list():
+    """CMD_GET_ALLOWED_REPEAT_FREQ replies with the response code and no ranges."""
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    frames: list[bytes] = []
+    server._write_frame = lambda f: frames.append(f)
+    await server._cmd_get_allowed_repeat_freq(b"")
+    assert frames == [bytes([RESP_CODE_ALLOWED_REPEAT_FREQ])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_raw_packet_unsupported_without_bridge_method():
+    """CMD_SEND_RAW_PACKET returns UNSUPPORTED when the bridge can't inject packets."""
+    bridge = Mock(spec=[])  # no send_raw_packet attribute
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_err = Mock()
+    server._write_ok = Mock()
+    await server._cmd_send_raw_packet(bytes([0x00, 0xAA, 0xBB]))
+    server._write_err.assert_called_once_with(ERR_CODE_UNSUPPORTED_CMD)
+    server._write_ok.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_raw_packet_delegates_to_bridge():
+    """CMD_SEND_RAW_PACKET parses [priority][raw...] and delegates to the bridge."""
+    bridge = Mock()
+    bridge.send_raw_packet = AsyncMock(return_value=True)
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_ok = Mock()
+    server._write_err = Mock()
+    await server._cmd_send_raw_packet(bytes([0x05, 0xDE, 0xAD, 0xBE]))
+    bridge.send_raw_packet.assert_awaited_once_with(0x05, b"\xde\xad\xbe")
+    server._write_ok.assert_called_once()
+    server._write_err.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_raw_packet_too_short():
+    """CMD_SEND_RAW_PACKET rejects a frame with no packet body."""
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    server._write_err = Mock()
+    await server._cmd_send_raw_packet(bytes([0x00]))
+    server._write_err.assert_called_once_with(ERR_CODE_ILLEGAL_ARG)
+
+
+def test_parse_binary_response_regions():
+    """Anon REGIONS response decodes clock + comma-separated region names."""
+    from pymc_core.companion import binary_parsing
+    from pymc_core.companion.constants import ANON_REQ_TYPE_REGIONS, PROTOCOL_CODE_ANON_REQ
+
+    # response_data (tag already stripped) = clock(4) + null-terminated name list
+    data = struct.pack("<I", 0x11223344) + b"home,usa,*\x00"
+    parsed = binary_parsing.parse_binary_response(
+        PROTOCOL_CODE_ANON_REQ, data, context={"anon_sub_type": ANON_REQ_TYPE_REGIONS}
+    )
+    assert parsed["type"] == "regions"
+    assert parsed["clock"] == 0x11223344
+    assert parsed["regions"] == ["home", "usa", "*"]
+
+
+def test_parse_binary_response_anon_not_mistaken_for_owner_info():
+    """A REGIONS anon response must NOT be parsed as REQ owner-info, even though
+    both carry numeric type 0x07."""
+    from pymc_core.companion import binary_parsing
+    from pymc_core.companion.constants import ANON_REQ_TYPE_REGIONS, PROTOCOL_CODE_ANON_REQ
+
+    data = struct.pack("<I", 0) + b"alpha\x00"
+    parsed = binary_parsing.parse_binary_response(
+        PROTOCOL_CODE_ANON_REQ, data, context={"anon_sub_type": ANON_REQ_TYPE_REGIONS}
+    )
+    assert parsed["type"] == "regions"
+    assert "owner_info" not in parsed
+
+
+def test_device_info_reports_firmware_ver_code_12():
+    """Companion advertises FIRMWARE_VER_CODE 12 to match the firmware dev branch."""
+    from pymc_core.companion.constants import FIRMWARE_VER_CODE
+
+    assert FIRMWARE_VER_CODE == 12

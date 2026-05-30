@@ -80,6 +80,16 @@ PROTOCOL_CODE_BINARY_REQ = 0x02
 PROTOCOL_CODE_ANON_REQ = 0x07
 
 # ---------------------------------------------------------------------------
+# Anonymous request sub-types (first byte of an ANON_REQ payload, after the
+# 4-byte timestamp). Used by the "discover regions from zero-hop repeaters"
+# feature and related anonymous queries. Note these collide numerically with
+# BinaryReqType values, so anon responses must be disambiguated by sub-type.
+# ---------------------------------------------------------------------------
+ANON_REQ_TYPE_REGIONS = 0x01  # repeater replies with comma-separated region names
+ANON_REQ_TYPE_OWNER = 0x02  # repeater replies with "name\nowner"
+ANON_REQ_TYPE_BASIC = 0x03  # repeater replies with clock + feature flags
+
+# ---------------------------------------------------------------------------
 # Default configuration
 # ---------------------------------------------------------------------------
 DEFAULT_RESPONSE_TIMEOUT_MS = 10000
@@ -98,7 +108,9 @@ MAX_PENDING_ACK_CRCS = 64
 # CMD_SEND_ANON_REQ (owner requests, etc.) is supported.
 # 10+ provides support for multi-byte path lengths.
 # 11+ adds channel binary datagrams and default flood scope commands.
-FIRMWARE_VER_CODE = 11
+# 12+ matches the MeshCore dev-branch companion (v1.15.x/1.16.0 family): adds
+#     CMD_GET_ALLOWED_REPEAT_FREQ and CMD_SEND_RAW_PACKET.
+FIRMWARE_VER_CODE = 12
 
 # ---------------------------------------------------------------------------
 # Commands (app -> radio)
@@ -155,10 +167,12 @@ CMD_GET_STATS = 56
 CMD_SEND_ANON_REQ = 57
 CMD_SET_AUTOADD_CONFIG = 58
 CMD_GET_AUTOADD_CONFIG = 59
+CMD_GET_ALLOWED_REPEAT_FREQ = 60
 CMD_SET_PATH_HASH_MODE = 61
 CMD_SEND_CHANNEL_DATA = 62
 CMD_SET_DEFAULT_FLOOD_SCOPE = 63
 CMD_GET_DEFAULT_FLOOD_SCOPE = 64
+CMD_SEND_RAW_PACKET = 65
 
 # ---------------------------------------------------------------------------
 # Response codes (radio -> app)
@@ -189,6 +203,7 @@ RESP_CODE_ADVERT_PATH = 22
 RESP_CODE_TUNING_PARAMS = 23
 RESP_CODE_STATS = 24
 RESP_CODE_AUTOADD_CONFIG = 25
+RESP_CODE_ALLOWED_REPEAT_FREQ = 26
 RESP_CODE_CHANNEL_DATA_RECV = 27
 RESP_CODE_DEFAULT_FLOOD_SCOPE = 28
 

@@ -29,12 +29,14 @@ from .constants import (
     CMD_EXPORT_CONTACT,
     CMD_EXPORT_PRIVATE_KEY,
     CMD_GET_ADVERT_PATH,
+    CMD_GET_ALLOWED_REPEAT_FREQ,
     CMD_GET_AUTOADD_CONFIG,
     CMD_GET_BATT_AND_STORAGE,
     CMD_GET_CHANNEL,
     CMD_GET_CONTACT_BY_KEY,
     CMD_GET_CONTACTS,
     CMD_GET_CUSTOM_VARS,
+    CMD_GET_DEFAULT_FLOOD_SCOPE,
     CMD_GET_DEVICE_TIME,
     CMD_GET_STATS,
     CMD_IMPORT_CONTACT,
@@ -50,6 +52,7 @@ from .constants import (
     CMD_SEND_LOGIN,
     CMD_SEND_PATH_DISCOVERY_REQ,
     CMD_SEND_RAW_DATA,
+    CMD_SEND_RAW_PACKET,
     CMD_SEND_SELF_ADVERT,
     CMD_SEND_STATUS_REQ,
     CMD_SEND_TELEMETRY_REQ,
@@ -60,10 +63,9 @@ from .constants import (
     CMD_SET_AUTOADD_CONFIG,
     CMD_SET_CHANNEL,
     CMD_SET_CUSTOM_VAR,
-    CMD_SET_DEVICE_TIME,
     CMD_SET_DEFAULT_FLOOD_SCOPE,
+    CMD_SET_DEVICE_TIME,
     CMD_SET_FLOOD_SCOPE,
-    CMD_GET_DEFAULT_FLOOD_SCOPE,
     CMD_SET_OTHER_PARAMS,
     CMD_SET_PATH_HASH_MODE,
     CMD_SET_RADIO_PARAMS,
@@ -79,8 +81,8 @@ from .constants import (
     FIRMWARE_VER_CODE,
     FRAME_INBOUND_PREFIX,
     FRAME_OUTBOUND_PREFIX,
-    MAX_FRAME_SIZE,
     MAX_CHANNEL_DATA_LENGTH,
+    MAX_FRAME_SIZE,
     MAX_PATH_SIZE,
     MAX_PAYLOAD_SIZE,
     OUT_PATH_UNKNOWN,
@@ -103,11 +105,11 @@ from .constants import (
     PUSH_CODE_TELEMETRY_RESPONSE,
     PUSH_CODE_TRACE_DATA,
     RESP_CODE_ADVERT_PATH,
+    RESP_CODE_ALLOWED_REPEAT_FREQ,
     RESP_CODE_AUTOADD_CONFIG,
     RESP_CODE_BATT_AND_STORAGE,
     RESP_CODE_CHANNEL_DATA_RECV,
     RESP_CODE_CHANNEL_INFO,
-    RESP_CODE_DEFAULT_FLOOD_SCOPE,
     RESP_CODE_CHANNEL_MSG_RECV,
     RESP_CODE_CHANNEL_MSG_RECV_V3,
     RESP_CODE_CONTACT,
@@ -116,6 +118,7 @@ from .constants import (
     RESP_CODE_CONTACTS_START,
     RESP_CODE_CURR_TIME,
     RESP_CODE_CUSTOM_VARS,
+    RESP_CODE_DEFAULT_FLOOD_SCOPE,
     RESP_CODE_DEVICE_INFO,
     RESP_CODE_END_OF_CONTACTS,
     RESP_CODE_ERR,
@@ -270,7 +273,9 @@ class CompanionFrameServer:
             CMD_GET_AUTOADD_CONFIG: self._cmd_get_autoadd_config,
             CMD_SET_OTHER_PARAMS: self._cmd_set_other_params,
             CMD_SEND_RAW_DATA: self._cmd_send_raw_data,
+            CMD_SEND_RAW_PACKET: self._cmd_send_raw_packet,
             CMD_SET_PATH_HASH_MODE: self._cmd_set_path_hash_mode,
+            CMD_GET_ALLOWED_REPEAT_FREQ: self._cmd_get_allowed_repeat_freq,
         }
 
     # -------------------------------------------------------------------------
@@ -2019,3 +2024,39 @@ class CompanionFrameServer:
             return
         self.bridge.set_path_hash_mode(mode)
         self._write_ok()
+
+    async def _cmd_get_allowed_repeat_freq(self, data: bytes) -> None:
+        """Handle CMD_GET_ALLOWED_REPEAT_FREQ (60).
+
+        Firmware (MyMesh.cpp:1958) replies with RESP_ALLOWED_REPEAT_FREQ followed
+        by zero or more (lower_freq, upper_freq) little-endian u32 pairs. The
+        virtual companion does not model regional repeat-frequency restrictions,
+        so it advertises an empty range list (response code with no pairs).
+        """
+        self._write_frame(bytes([RESP_CODE_ALLOWED_REPEAT_FREQ]))
+
+    async def _cmd_send_raw_packet(self, data: bytes) -> None:
+        """Handle CMD_SEND_RAW_PACKET (65). Format: [priority(1)][raw_packet...].
+
+        Mirrors MyMesh.cpp:1967: inject a low-level packet with a TX priority.
+        Delegates to the bridge's ``send_raw_packet`` if available.
+        """
+        if len(data) < 3:
+            self._write_err(ERR_CODE_ILLEGAL_ARG)
+            return
+        priority = data[0]
+        packet_bytes = data[1:]
+        send_raw_packet = getattr(self.bridge, "send_raw_packet", None)
+        if not send_raw_packet:
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+            return
+        try:
+            ok = await send_raw_packet(priority, packet_bytes)
+        except Exception as e:
+            logger.error("send_raw_packet error: %s", e, exc_info=True)
+            self._write_err(ERR_CODE_ILLEGAL_ARG)
+            return
+        if ok:
+            self._write_ok()
+        else:
+            self._write_err(ERR_CODE_TABLE_FULL)

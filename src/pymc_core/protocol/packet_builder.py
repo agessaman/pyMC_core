@@ -443,6 +443,68 @@ class PacketBuilder:
         return pkt
 
     @staticmethod
+    def create_anon_request(
+        contact: Any,
+        local_identity: LocalIdentity,
+        req_data: bytes = b"",
+        timestamp: Optional[int] = None,
+    ) -> tuple[Packet, int]:
+        """Create a PAYLOAD_TYPE_ANON_REQ packet for an anonymous request.
+
+        Unlike ``create_protocol_request`` (which builds a PAYLOAD_TYPE_REQ and
+        relies on the recipient already knowing the sender), this emits a true
+        anonymous request: ``dest_hash(1) + sender_pubkey(32) + cipher`` under a
+        PAYLOAD_TYPE_ANON_REQ header. The decrypted plaintext is
+        ``timestamp(4) + req_data`` with ``req_data`` passed through verbatim
+        (e.g. ``[ANON_REQ_TYPE_REGIONS][reply_path_byte][reply_path...]``); no
+        protocol/sub-type byte is prepended.
+
+        Routing mirrors firmware ``BaseChatMesh::sendAnonReq``: direct when the
+        out_path is known (``out_path_len >= 0``, including ``0`` for a zero-hop
+        direct neighbour) and flood when unknown (``-1``). The firmware regions
+        handler only answers ``isRouteDirect()`` packets, so zero-hop discovery
+        requires direct routing.
+
+        Returns:
+            tuple: (packet, timestamp) - the packet and the timestamp used as the
+            request tag (echoed back by the responder).
+        """
+        if timestamp is None:
+            timestamp = PacketBuilder._get_timestamp()
+
+        plaintext = PacketBuilder._pack_timestamp_data(timestamp, req_data)
+
+        contact_pubkey = bytes.fromhex(contact.public_key)
+        shared_secret, aes_key = PacketBuilder._calc_shared_secret_and_key(contact, local_identity)
+        cipher = PacketBuilder._encrypt_payload(aes_key, shared_secret, plaintext)
+        dest_hash = PacketBuilder._hash_byte(contact_pubkey)
+        payload = bytearray([dest_hash]) + local_identity.get_public_key() + cipher
+
+        out_path_len = getattr(contact, "out_path_len", -1)
+        out_path = getattr(contact, "out_path", b"") or b""
+        # Direct (incl. zero-hop, out_path_len == 0) when the path is known;
+        # flood only when the out_path is unknown (-1 / OUT_PATH_UNKNOWN).
+        route_type = "direct" if out_path_len >= 0 else "flood"
+
+        header = PacketBuilder._create_header(PAYLOAD_TYPE_ANON_REQ, route_type)
+        packet = PacketBuilder._create_packet(header, payload)
+        packet.path_len = 0
+        packet.path = bytearray()
+
+        if route_type == "direct" and len(out_path) > 0:
+            path_bytes = out_path[:MAX_PATH_SIZE]
+            encoded_len = None
+            if PathUtils.is_valid_path_len(out_path_len) and PathUtils.get_path_byte_len(
+                out_path_len
+            ) <= len(path_bytes):
+                encoded_len = out_path_len
+            elif len(path_bytes) == 64:
+                path_bytes = path_bytes[:63]
+            packet.set_path(path_bytes, encoded_len)
+
+        return packet, timestamp
+
+    @staticmethod
     def create_login_packet(contact: Any, local_identity: LocalIdentity, password: str) -> Packet:
         """
         Create a login packet for repeater authentication.

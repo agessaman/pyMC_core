@@ -5,7 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from .constants import BinaryReqType
+from .constants import (
+    ANON_REQ_TYPE_BASIC,
+    ANON_REQ_TYPE_OWNER,
+    ANON_REQ_TYPE_REGIONS,
+    BinaryReqType,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +22,19 @@ def parse_binary_response(
     context: Optional[dict] = None,
 ) -> Optional[dict]:
     """Parse response_data by request_type. Returns dict or None."""
+    context = context or {}
+    # Anonymous requests (CMD_SEND_ANON_REQ) all carry request_type 0x07, which
+    # collides with BinaryReqType.OWNER_INFO. Disambiguate by the recorded
+    # ANON_REQ_TYPE_* sub-type so a regions reply is not parsed as owner info.
+    anon_sub_type = context.get("anon_sub_type")
+    if anon_sub_type is not None:
+        if anon_sub_type == ANON_REQ_TYPE_REGIONS:
+            return _parse_regions(data)
+        if anon_sub_type == ANON_REQ_TYPE_OWNER:
+            return _parse_anon_owner(data)
+        if anon_sub_type == ANON_REQ_TYPE_BASIC:
+            return _parse_anon_basic(data)
+        return {"raw_hex": data.hex(), "anon_sub_type": anon_sub_type}
     if request_type == BinaryReqType.STATUS and len(data) >= 52:
         return _parse_status(data, pubkey_prefix=pubkey_prefix or None)
     if request_type == BinaryReqType.TELEMETRY and len(data) >= 0:
@@ -109,6 +127,55 @@ def _parse_owner_info(data: bytes) -> dict:
     except Exception:
         logger.debug("Owner info parse failed, returning fallback", exc_info=True)
         return {"raw_hex": data.hex(), "request_type": BinaryReqType.OWNER_INFO}
+
+
+def _parse_regions(data: bytes) -> dict:
+    """Parse ANON_REQ_TYPE_REGIONS response: clock(4) + region-name list.
+
+    The responder replies with tag(4) + clock(4) + names; the tag is stripped by
+    the caller, so ``data`` is clock(4) + names. Names are a null-terminated,
+    comma-separated string ('*' denotes the wildcard region; '#' prefixes are
+    already stripped by the firmware's exportNamesTo).
+    """
+    try:
+        clock = int.from_bytes(data[:4], "little") if len(data) >= 4 else 0
+        raw = data[4:].split(b"\x00", 1)[0]
+        text = raw.decode("utf-8", errors="replace")
+        regions = [r for r in text.split(",") if r != ""]
+        return {"type": "regions", "clock": clock, "regions": regions}
+    except Exception:
+        logger.debug("Regions parse failed, returning fallback", exc_info=True)
+        return {"raw_hex": data.hex(), "anon_sub_type": ANON_REQ_TYPE_REGIONS}
+
+
+def _parse_anon_owner(data: bytes) -> dict:
+    """Parse ANON_REQ_TYPE_OWNER response: clock(4) + 'name\\nowner'."""
+    try:
+        clock = int.from_bytes(data[:4], "little") if len(data) >= 4 else 0
+        text = data[4:].split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+        parts = text.split("\n", 1)
+        return {
+            "type": "owner",
+            "clock": clock,
+            "node_name": parts[0] if len(parts) > 0 else "",
+            "owner_info": parts[1] if len(parts) > 1 else "",
+        }
+    except Exception:
+        logger.debug("Anon owner parse failed, returning fallback", exc_info=True)
+        return {"raw_hex": data.hex(), "anon_sub_type": ANON_REQ_TYPE_OWNER}
+
+
+def _parse_anon_basic(data: bytes) -> dict:
+    """Parse ANON_REQ_TYPE_BASIC response: clock(4) + feature flags(1)."""
+    clock = int.from_bytes(data[:4], "little") if len(data) >= 4 else 0
+    features = data[4] if len(data) >= 5 else 0
+    return {
+        "type": "basic",
+        "clock": clock,
+        "features": features,
+        "is_bridge": bool(features & 0x01),
+        "is_disabled": bool(features & 0x80),
+    }
 
 
 def _parse_acl(buf: bytes) -> dict:

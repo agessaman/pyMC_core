@@ -4,6 +4,7 @@ from pymc_core.protocol.constants import (
     MAX_PACKET_PAYLOAD,
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
+    PAYLOAD_TYPE_ANON_REQ,
     PAYLOAD_TYPE_PATH,
     PAYLOAD_TYPE_RAW_CUSTOM,
 )
@@ -265,3 +266,65 @@ def test_truncated_path_packet_round_trip():
     assert ok
     assert pkt2.get_path_byte_len() == len(pkt2.path)
     assert pkt2.get_path_byte_len() == 63
+
+
+def _make_contact(other, out_path=b"", out_path_len=-1):
+    return type(
+        "Contact",
+        (),
+        {
+            "public_key": other.get_public_key().hex(),
+            "out_path": out_path,
+            "out_path_len": out_path_len,
+        },
+    )()
+
+
+def _decrypt_anon(pkt, sender_local, recipient_local):
+    """Decrypt an ANON_REQ packet: payload = dest_hash(1)+sender_pubkey(32)+cipher."""
+    assert pkt.payload[1:33] == bytes(sender_local.get_public_key())
+    cipher = bytes(pkt.payload[33:])
+    secret = Identity(sender_local.get_public_key()).calc_shared_secret(
+        recipient_local.get_private_key()
+    )
+    return CryptoUtils.mac_then_decrypt(secret[:16], secret, cipher)
+
+
+def test_create_anon_request_is_anon_payload_type_no_subtype_prefix():
+    """Regression: anon requests must be PAYLOAD_TYPE_ANON_REQ with the client's
+    sub-type byte at offset 4 (after the 4-byte timestamp) - NOT a PAYLOAD_TYPE_REQ
+    with 0x07 prepended (which repeaters read as REQ_TYPE_GET_OWNER_INFO)."""
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = _make_contact(other, out_path=b"", out_path_len=0)  # zero-hop neighbour
+    # ANON_REQ_TYPE_REGIONS (0x01) + reply-path byte (0 = empty path)
+    req_data = bytes([0x01, 0x00])
+    pkt, ts = PacketBuilder.create_anon_request(contact, local, req_data)
+
+    assert pkt.get_payload_type() == PAYLOAD_TYPE_ANON_REQ
+    plaintext = _decrypt_anon(pkt, local, other)
+    assert int.from_bytes(plaintext[:4], "little") == ts
+    # sub-type byte sits immediately after the timestamp, with no 0x07 prefix
+    assert plaintext[4] == 0x01
+    # (trailing bytes are AES block padding, ignored by the responder)
+    assert plaintext[4 : 4 + len(req_data)] == req_data
+
+
+def test_create_anon_request_zero_hop_is_direct():
+    """out_path_len == 0 (zero-hop direct neighbour) must route DIRECT so the
+    firmware regions handler (which requires isRouteDirect()) answers."""
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = _make_contact(other, out_path=b"", out_path_len=0)
+    pkt, _ = PacketBuilder.create_anon_request(contact, local, bytes([0x01, 0x00]))
+    assert pkt.is_route_direct()
+    assert not pkt.is_route_flood()
+
+
+def test_create_anon_request_unknown_path_is_flood():
+    """out_path_len == -1 (unknown) must route FLOOD."""
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = _make_contact(other, out_path=b"", out_path_len=-1)
+    pkt, _ = PacketBuilder.create_anon_request(contact, local, bytes([0x01, 0x00]))
+    assert pkt.is_route_flood()
