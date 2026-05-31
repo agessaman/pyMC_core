@@ -4,6 +4,7 @@ Message handlers for different packet types
 
 from .ack import AckHandler
 from .advert import AdvertHandler
+from .anon_request import AnonRateLimiter, AnonRequestHandler
 from .base import BaseHandler
 from .control import ControlHandler
 from .group_text import GroupTextHandler
@@ -17,6 +18,8 @@ from .trace import TraceHandler
 
 __all__ = [
     "BaseHandler",
+    "AnonRequestHandler",
+    "AnonRateLimiter",
     "TextMessageHandler",
     "AdvertHandler",
     "AckHandler",
