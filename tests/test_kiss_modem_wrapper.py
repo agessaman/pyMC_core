@@ -7,13 +7,15 @@ and LoRaRadio interface implementation.
 
 import struct
 import threading
-from unittest.mock import MagicMock, patch
+import time
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from pymc_core.hardware.kiss_modem_wrapper import (
     CMD_DATA,
     CMD_GET_BATTERY,
+    CMD_GET_NOISE_FLOOR,
     CMD_GET_RADIO,
     CMD_GET_STATS,
     CMD_GET_VERSION,
@@ -27,6 +29,7 @@ from pymc_core.hardware.kiss_modem_wrapper import (
     HW_CMD_GET_VERSION,
     HW_CMD_REBOOT,
     HW_CMD_SET_SIGNAL_REPORT,
+    HW_ERR_TX_BUSY,
     HW_RESP_DEVICE_NAME,
     HW_RESP_MCU_TEMP,
     HW_RESP_OK,
@@ -44,12 +47,15 @@ from pymc_core.hardware.kiss_modem_wrapper import (
     RESP_BATTERY,
     RESP_ERROR,
     RESP_IDENTITY,
+    RESP_NOISE_FLOOR,
     RESP_OK,
     RESP_PONG,
     RESP_RADIO,
     RESP_SIGNATURE,
     RESP_STATS,
     RESP_TX_DONE,
+    RESP_VERSION,
+    RESPONSE_TIMEOUT,
     KissModemWrapper,
 )
 
@@ -274,15 +280,13 @@ class TestCommandResponses:
             bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_IDENTITY]) + pubkey + bytes([KISS_FEND])
         )
 
-        modem._response_event = threading.Event()
-        modem._pending_response = None
-
         for byte in raw_bytes:
             modem._decode_kiss_byte(byte)
 
-        assert modem._pending_response is not None
-        assert modem._pending_response[0] == RESP_IDENTITY
-        assert modem._pending_response[1] == pubkey
+        # Without an active waiter, SetHardware responses are queued for later consumption.
+        assert len(modem._response_queue) == 1
+        assert modem._response_queue[0][0] == RESP_IDENTITY
+        assert modem._response_queue[0][1] == pubkey
 
     def test_response_parsing_error(self):
         """Test parsing SetHardware Error response (FEND + 0x06 + 0x2A + code + FEND)"""
@@ -291,15 +295,259 @@ class TestCommandResponses:
 
         raw_bytes = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_ERROR, 0x05, KISS_FEND])
 
-        modem._response_event = threading.Event()
-        modem._pending_response = None
-
         for byte in raw_bytes:
             modem._decode_kiss_byte(byte)
 
-        assert modem._pending_response is not None
-        assert modem._pending_response[0] == RESP_ERROR
-        assert modem._pending_response[1][0] == 0x05
+        assert len(modem._response_queue) == 1
+        assert modem._response_queue[0][0] == RESP_ERROR
+        assert modem._response_queue[0][1][0] == 0x05
+
+    def test_send_command_uses_queued_late_response(self):
+        """If a matching response is already queued, _send_command returns it without writing."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        # Queue a late PONG from a previous ping.
+        modem._response_queue.append((RESP_PONG, b""))
+
+        modem._write_frame = MagicMock(return_value=True)
+
+        resp = modem._send_command(CMD_PING, timeout=0.1)
+        assert resp == (RESP_PONG, b"")
+        assert modem._write_frame.call_count == 0
+
+    def test_send_command_correlates_expected_response(self):
+        """Non-matching responses are queued; waiter completes only on expected sub_cmd."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        # Set up a serial conn so _send_command can write.
+        mock_serial = MagicMock()
+        mock_serial.is_open = True
+        mock_serial.write.side_effect = lambda b: len(b)
+        modem.serial_conn = mock_serial
+
+        result_holder: dict[str, object] = {}
+
+        def caller():
+            result_holder["resp"] = modem._send_command(CMD_PING, timeout=0.5)
+
+        t = threading.Thread(target=caller)
+        t.start()
+
+        # Feed an unrelated identity response first; should be queued, not delivered.
+        pubkey = bytes(range(32))
+        identity_bytes = (
+            bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_IDENTITY]) + pubkey + bytes([KISS_FEND])
+        )
+        for b in identity_bytes:
+            modem._decode_kiss_byte(b)
+
+        # Now feed the expected PONG.
+        pong_bytes = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_PONG, KISS_FEND])
+        for b in pong_bytes:
+            modem._decode_kiss_byte(b)
+
+        t.join(timeout=1.0)
+        assert result_holder.get("resp") == (RESP_PONG, b"")
+
+        # The unrelated identity response should remain queued.
+        assert len(modem._response_queue) == 1
+        assert modem._response_queue[0][0] == RESP_IDENTITY
+
+    def test_send_command_is_single_flight(self):
+        """Concurrent _send_command calls must not interleave shared waiter state."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        wrote_first = threading.Event()
+        allow_first_write = threading.Event()
+        wrote_second = threading.Event()
+
+        def mock_write_frame(frame: bytes) -> bool:
+            # sub_cmd is the first payload byte (frame[2]) in SetHardware frames.
+            if frame[2] == CMD_GET_VERSION:
+                wrote_first.set()
+                allow_first_write.wait(timeout=1.0)
+            elif frame[2] == CMD_PING:
+                wrote_second.set()
+            return True
+
+        modem._write_frame = mock_write_frame
+
+        results: dict[str, object] = {}
+
+        def call_version():
+            results["v"] = modem._send_command(CMD_GET_VERSION, timeout=0.5)
+
+        def call_ping():
+            results["p"] = modem._send_command(CMD_PING, timeout=0.5)
+
+        t1 = threading.Thread(target=call_version)
+        t2 = threading.Thread(target=call_ping)
+
+        t1.start()
+        assert wrote_first.wait(timeout=1.0)
+
+        # Start second call while first is still holding the command lock in _write_frame.
+        t2.start()
+        assert not wrote_second.wait(timeout=0.1)
+
+        # Let the first command proceed and respond.
+        allow_first_write.set()
+        version_bytes = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_VERSION, 0x01, KISS_FEND])
+        for b in version_bytes:
+            modem._decode_kiss_byte(b)
+
+        # Now second command can write and receive response.
+        assert wrote_second.wait(timeout=1.0)
+        pong_bytes = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_PONG, KISS_FEND])
+        for b in pong_bytes:
+            modem._decode_kiss_byte(b)
+
+        t1.join(timeout=1.0)
+        t2.join(timeout=1.0)
+
+        assert results.get("v") is not None
+        assert results.get("p") == (RESP_PONG, b"")
+
+    def test_send_command_timeout_clears_waiter_state(self):
+        """Timeout path must clear active waiter metadata for later commands."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem._write_frame = MagicMock(return_value=True)
+
+        resp = modem._send_command(CMD_GET_VERSION, timeout=0.05)
+        assert resp is None
+        assert modem._expected_response_subcmds is None
+        assert modem._active_request_subcmd is None
+
+        # Ensure no lock leak by issuing another command.
+        resp2 = modem._send_command(CMD_PING, timeout=0.05)
+        assert resp2 is None
+        assert modem._expected_response_subcmds is None
+        assert modem._active_request_subcmd is None
+
+    def test_send_command_write_failure_clears_waiter_state(self):
+        """Write-failure path must clear active waiter metadata."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem._write_frame = MagicMock(return_value=False)
+
+        resp = modem._send_command(CMD_GET_VERSION, timeout=0.1)
+        assert resp is None
+        assert modem._expected_response_subcmds is None
+        assert modem._active_request_subcmd is None
+
+    def test_response_queue_drop_oldest_when_full(self):
+        """Unmatched SetHardware responses should drop oldest when queue is full."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        maxlen = modem._response_queue.maxlen or 0
+        for i in range(maxlen):
+            modem._response_queue.append((0xA0 + (i % 10), bytes([i % 256])))
+        oldest = modem._response_queue[0]
+
+        # No active waiter; incoming response should be enqueued as unmatched.
+        frame = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_IDENTITY, 0x42, KISS_FEND])
+        for b in frame:
+            modem._decode_kiss_byte(b)
+
+        assert len(modem._response_queue) == maxlen
+        assert modem._response_queue[0] != oldest
+        assert modem._response_queue[-1] == (RESP_IDENTITY, b"\x42")
+
+    def test_send_command_ok_policy_allowlisted_command(self):
+        """Allowlisted SetHardware commands may resolve with HW_RESP_OK."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        mock_serial = MagicMock()
+        mock_serial.is_open = True
+        mock_serial.write.side_effect = lambda b: len(b)
+        modem.serial_conn = mock_serial
+
+        result_holder: dict[str, object] = {}
+
+        def caller():
+            result_holder["resp"] = modem._send_command(CMD_SET_TX_POWER, b"\x16", timeout=0.5)
+
+        t = threading.Thread(target=caller)
+        t.start()
+
+        ok_frame = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, HW_RESP_OK, KISS_FEND])
+        for b in ok_frame:
+            modem._decode_kiss_byte(b)
+
+        t.join(timeout=1.0)
+        assert result_holder.get("resp") == (HW_RESP_OK, b"")
+
+    def test_send_command_ok_policy_non_allowlisted_command(self):
+        """Non-allowlisted commands should not complete on HW_RESP_OK."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        mock_serial = MagicMock()
+        mock_serial.is_open = True
+        mock_serial.write.side_effect = lambda b: len(b)
+        modem.serial_conn = mock_serial
+
+        result_holder: dict[str, object] = {}
+
+        def caller():
+            result_holder["resp"] = modem._send_command(CMD_PING, timeout=0.5)
+
+        t = threading.Thread(target=caller)
+        t.start()
+
+        ok_frame = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, HW_RESP_OK, KISS_FEND])
+        for b in ok_frame:
+            modem._decode_kiss_byte(b)
+
+        pong_frame = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_PONG, KISS_FEND])
+        for b in pong_frame:
+            modem._decode_kiss_byte(b)
+
+        t.join(timeout=1.0)
+        assert result_holder.get("resp") == (RESP_PONG, b"")
+        assert len(modem._response_queue) == 1
+        assert modem._response_queue[0] == (HW_RESP_OK, b"")
+
+    def test_send_command_preserves_unrelated_response_order(self):
+        """Multiple unrelated responses remain queued in arrival order."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        mock_serial = MagicMock()
+        mock_serial.is_open = True
+        mock_serial.write.side_effect = lambda b: len(b)
+        modem.serial_conn = mock_serial
+
+        result_holder: dict[str, object] = {}
+
+        def caller():
+            result_holder["resp"] = modem._send_command(CMD_PING, timeout=0.5)
+
+        t = threading.Thread(target=caller)
+        t.start()
+
+        identity = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_IDENTITY, 0xAA, KISS_FEND])
+        version = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_VERSION, 0x01, KISS_FEND])
+        stats = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_STATS, 0x02, KISS_FEND])
+        for frame in (identity, version, stats):
+            for b in frame:
+                modem._decode_kiss_byte(b)
+
+        pong = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_PONG, KISS_FEND])
+        for b in pong:
+            modem._decode_kiss_byte(b)
+
+        t.join(timeout=1.0)
+        assert result_holder.get("resp") == (RESP_PONG, b"")
+        assert [entry[0] for entry in modem._response_queue] == [
+            RESP_IDENTITY,
+            RESP_VERSION,
+            RESP_STATS,
+        ]
+        assert [entry[1] for entry in modem._response_queue] == [b"\xAA", b"\x01", b"\x02"]
 
     def test_tx_done_response(self):
         """Test SetHardware TxDone (0xF8) response sets event"""
@@ -314,6 +562,82 @@ class TestCommandResponses:
 
         assert modem._tx_done_event.is_set()
         assert modem._tx_done_result is True
+
+    @pytest.mark.asyncio
+    async def test_send_offloads_get_airtime_to_thread(self):
+        """send() must not call blocking get_airtime on the asyncio event loop."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem.send_frame_and_wait = MagicMock(return_value=True)
+
+        async def to_thread_side_effect(fn, *args, **kwargs):
+            if to_thread_side_effect.calls == 0:
+                to_thread_side_effect.calls += 1
+                return True
+            to_thread_side_effect.calls += 1
+            return 42
+
+        to_thread_side_effect.calls = 0
+
+        to_thread_mock = AsyncMock(side_effect=to_thread_side_effect)
+        with patch("pymc_core.hardware.kiss_modem_wrapper.asyncio.to_thread", to_thread_mock):
+            result = await modem.send(b"payload")
+
+        assert result is not None
+        assert result["airtime_ms"] == 42
+        assert to_thread_mock.await_count == 2
+        to_thread_mock.assert_any_await(modem.send_frame_and_wait, b"payload", RESPONSE_TIMEOUT)
+        to_thread_mock.assert_any_await(modem.get_airtime, len(b"payload"), 1.0)
+
+
+class TestKissAsyncTelemetry:
+    """Async-safe telemetry entrypoints delegate blocking work via asyncio.to_thread."""
+
+    @pytest.mark.asyncio
+    async def test_get_status_async_delegates_to_thread(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        to_thread_mock = AsyncMock(return_value={"ok": True})
+        with patch("pymc_core.hardware.kiss_modem_wrapper.asyncio.to_thread", to_thread_mock):
+            result = await modem.get_status_async(1.25)
+        assert result == {"ok": True}
+        to_thread_mock.assert_awaited_once_with(modem._sync_get_status, 1.25)
+
+    @pytest.mark.asyncio
+    async def test_get_noise_floor_async_delegates_to_thread(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        to_thread_mock = AsyncMock(return_value=-95)
+        with patch("pymc_core.hardware.kiss_modem_wrapper.asyncio.to_thread", to_thread_mock):
+            result = await modem.get_noise_floor_async(0.75)
+        assert result == -95
+        to_thread_mock.assert_awaited_once_with(modem.get_noise_floor, 0.75)
+
+    @pytest.mark.asyncio
+    async def test_get_modem_stats_async_delegates_to_thread(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        stats = {"rx": 1, "tx": 2, "errors": 0}
+        to_thread_mock = AsyncMock(return_value=stats)
+        with patch("pymc_core.hardware.kiss_modem_wrapper.asyncio.to_thread", to_thread_mock):
+            result = await modem.get_modem_stats_async(None)
+        assert result == stats
+        to_thread_mock.assert_awaited_once_with(modem.get_modem_stats, None)
+
+    def test_get_noise_floor_forwards_timeout_to_send_command(self):
+        """Optional timeout on sync getter must reach _send_command."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        calls: list[tuple] = []
+
+        def mock_send_command(cmd, data=b"", timeout=5.0):
+            calls.append((cmd, data, timeout))
+            if cmd == CMD_GET_NOISE_FLOOR:
+                return (RESP_NOISE_FLOOR, struct.pack("<h", -88))
+            return None
+
+        modem._send_command = mock_send_command
+        assert modem.get_noise_floor(timeout=0.42) == -88
+        assert len(calls) == 1
+        assert calls[0][0] == CMD_GET_NOISE_FLOOR
+        assert calls[0][2] == 0.42
 
 
 class TestRadioConfiguration:
@@ -359,6 +683,7 @@ class TestRadioConfiguration:
 
         modem._send_command = mock_send_command
         modem.is_connected = True
+        modem.serial_conn = MagicMock(is_open=True)
 
         result = modem.configure_radio()
 
@@ -519,6 +844,281 @@ class TestSendFrame:
         assert frame[0] == KISS_FEND
         assert frame[1] == CMD_DATA
         assert frame[-1] == KISS_FEND
+
+
+class TestSerialWriteSerialization:
+    """Test UART write serialization across concurrent callers."""
+
+    def test_write_frame_serializes_data_and_sethardware_callers(self):
+        """Data TX and SetHardware writes must not interleave at the UART layer."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+
+        class BlockingSerial:
+            def __init__(self):
+                self.is_open = True
+                self._active = 0
+                self.max_active = 0
+                self._state_lock = threading.Lock()
+                self.first_write_entered = threading.Event()
+                self.release_first_write = threading.Event()
+                self.first_seen = False
+                self.writes = []
+                self.flush_count = 0
+
+            def write(self, data):
+                with self._state_lock:
+                    self._active += 1
+                    self.max_active = max(self.max_active, self._active)
+
+                if not self.first_seen:
+                    self.first_seen = True
+                    self.first_write_entered.set()
+                    self.release_first_write.wait(timeout=1.0)
+
+                self.writes.append(bytes(data))
+
+                with self._state_lock:
+                    self._active -= 1
+                return len(data)
+
+            def flush(self):
+                self.flush_count += 1
+
+        serial_conn = BlockingSerial()
+        modem.serial_conn = serial_conn
+        modem.is_connected = True
+
+        data_frame = modem._encode_kiss_frame(CMD_DATA, b"\x01\x02\x03")
+        sethw_frame = modem._encode_kiss_frame(KISS_CMD_SETHARDWARE, bytes([CMD_PING]))
+
+        results: dict[str, bool] = {}
+        second_started = threading.Event()
+        second_done = threading.Event()
+
+        def write_data():
+            results["data"] = modem._write_frame(data_frame)
+
+        def write_sethw():
+            second_started.set()
+            results["sethw"] = modem._write_frame(sethw_frame)
+            second_done.set()
+
+        t1 = threading.Thread(target=write_data)
+        t1.start()
+        assert serial_conn.first_write_entered.wait(timeout=1.0)
+
+        t2 = threading.Thread(target=write_sethw)
+        t2.start()
+        assert second_started.wait(timeout=1.0)
+
+        # While the first writer is blocked inside serial.write, a second caller
+        # should not enter serial.write concurrently.
+        assert not second_done.wait(timeout=0.05)
+        assert serial_conn.max_active == 1
+
+        serial_conn.release_first_write.set()
+
+        t1.join(timeout=1.0)
+        t2.join(timeout=1.0)
+
+        assert results.get("data") is True
+        assert results.get("sethw") is True
+        assert serial_conn.max_active == 1
+        assert serial_conn.flush_count == 2
+        assert serial_conn.writes == [data_frame, sethw_frame]
+
+    def test_ping_and_noise_floor_under_concurrent_data_load(self):
+        """Concurrent data TX should not cause ping/noise-floor command timeouts."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        class RespondingSerial:
+            def __init__(self):
+                self.is_open = True
+                self._modem: KissModemWrapper | None = None
+                self.flush_count = 0
+
+            def set_modem(self, m: KissModemWrapper) -> None:
+                self._modem = m
+
+            def write(self, data):
+                frame = bytes(data)
+                if (
+                    self._modem is not None
+                    and len(frame) >= 4
+                    and frame[0] == KISS_FEND
+                    and frame[-1] == KISS_FEND
+                    and frame[1] == KISS_CMD_SETHARDWARE
+                ):
+                    sub_cmd = frame[2]
+                    if sub_cmd == CMD_PING:
+                        response_sub = RESP_PONG
+                        response_payload = b""
+                    elif sub_cmd == CMD_GET_NOISE_FLOOR:
+                        response_sub = RESP_NOISE_FLOOR
+                        response_payload = struct.pack("<h", -95)
+                    else:
+                        response_sub = None
+                        response_payload = b""
+
+                    if response_sub is not None:
+
+                        def emit() -> None:
+                            resp = (
+                                bytes([KISS_FEND, KISS_CMD_SETHARDWARE, response_sub])
+                                + response_payload
+                                + bytes([KISS_FEND])
+                            )
+                            for b in resp:
+                                self._modem._decode_kiss_byte(b)
+
+                        threading.Thread(target=emit, daemon=True).start()
+                return len(frame)
+
+            def flush(self):
+                self.flush_count += 1
+
+        serial_conn = RespondingSerial()
+        serial_conn.set_modem(modem)
+        modem.serial_conn = serial_conn
+
+        stop_event = threading.Event()
+        data_frame = modem._encode_kiss_frame(CMD_DATA, b"\xAA\xBB\xCC")
+
+        def data_tx_worker() -> None:
+            for _ in range(200):
+                if stop_event.is_set():
+                    return
+                modem._write_frame(data_frame)
+
+        tx_thread = threading.Thread(target=data_tx_worker)
+        tx_thread.start()
+
+        try:
+            for _ in range(40):
+                ping_resp = modem._send_command(CMD_PING, timeout=0.2)
+                assert ping_resp is not None
+                assert ping_resp[0] == RESP_PONG
+
+                noise = modem.get_noise_floor(timeout=0.2)
+                assert noise == -95
+        finally:
+            stop_event.set()
+            tx_thread.join(timeout=1.0)
+
+    def test_tx_worker_and_sethardware_queries_make_progress_together(self):
+        """Queued data TX should still make progress while periodic SetHardware queries run."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        class RespondingSerial:
+            def __init__(self):
+                self.is_open = True
+                self._modem: KissModemWrapper | None = None
+                self.flush_count = 0
+                self.data_writes = 0
+
+            def set_modem(self, m: KissModemWrapper) -> None:
+                self._modem = m
+
+            def write(self, data):
+                frame = bytes(data)
+                if (
+                    self._modem is not None
+                    and len(frame) >= 4
+                    and frame[0] == KISS_FEND
+                    and frame[-1] == KISS_FEND
+                    and frame[1] == KISS_CMD_SETHARDWARE
+                ):
+                    sub_cmd = frame[2]
+                    if sub_cmd == CMD_PING:
+                        response_sub = RESP_PONG
+                        response_payload = b""
+                    elif sub_cmd == CMD_GET_NOISE_FLOOR:
+                        response_sub = RESP_NOISE_FLOOR
+                        response_payload = struct.pack("<h", -92)
+                    else:
+                        response_sub = None
+                        response_payload = b""
+
+                    if response_sub is not None:
+
+                        def emit() -> None:
+                            resp = (
+                                bytes([KISS_FEND, KISS_CMD_SETHARDWARE, response_sub])
+                                + response_payload
+                                + bytes([KISS_FEND])
+                            )
+                            for b in resp:
+                                self._modem._decode_kiss_byte(b)
+
+                        threading.Thread(target=emit, daemon=True).start()
+                elif len(frame) >= 2 and frame[0] == KISS_FEND and frame[1] == CMD_DATA:
+                    self.data_writes += 1
+
+                return len(frame)
+
+            def flush(self):
+                self.flush_count += 1
+
+        serial_conn = RespondingSerial()
+        serial_conn.set_modem(modem)
+        modem.serial_conn = serial_conn
+
+        for _ in range(120):
+            assert modem.send_frame(b"\x01\x02\x03")
+
+        modem.stop_event.clear()
+        tx_thread = threading.Thread(target=modem._tx_worker, daemon=True)
+        tx_thread.start()
+
+        try:
+            for _ in range(25):
+                ping_resp = modem._send_command(CMD_PING, timeout=0.3)
+                assert ping_resp is not None
+                assert ping_resp[0] == RESP_PONG
+
+                noise = modem.get_noise_floor(timeout=0.3)
+                assert noise == -92
+
+            deadline = time.time() + 2.0
+            while modem.tx_buffer and time.time() < deadline:
+                time.sleep(0.01)
+            assert len(modem.tx_buffer) == 0
+            assert serial_conn.data_writes > 0
+        finally:
+            modem.stop_event.set()
+            tx_thread.join(timeout=1.0)
+
+    def test_write_error_does_not_poison_future_writes(self):
+        """A serial write error should fail fast and transition to degraded mode."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        class FlakySerial:
+            def __init__(self):
+                self.is_open = True
+                self.calls = 0
+                self.flush_count = 0
+
+            def write(self, data):
+                self.calls += 1
+                if self.calls == 1:
+                    raise OSError("simulated serial failure")
+                return len(data)
+
+            def flush(self):
+                self.flush_count += 1
+
+        serial_conn = FlakySerial()
+        modem.serial_conn = serial_conn
+        modem._start_reconnect_worker = MagicMock()
+
+        frame = modem._encode_kiss_frame(CMD_DATA, b"\xAA\xBB")
+        assert modem._write_frame(frame) is False
+        assert modem._degraded is True
+        assert modem.is_connected is False
+        modem._start_reconnect_worker.assert_called_once()
 
 
 class TestQueryMethods:
@@ -749,6 +1349,7 @@ class TestRadioConfigCompatibility:
 
         modem._send_command = mock_send_command
         modem.is_connected = True
+        modem.serial_conn = MagicMock(is_open=True)
 
         modem.configure_radio()
 
@@ -773,6 +1374,7 @@ class TestRadioConfigCompatibility:
 
         modem._send_command = mock_send_command
         modem.is_connected = True
+        modem.serial_conn = MagicMock(is_open=True)
 
         modem.configure_radio()
 
@@ -797,6 +1399,7 @@ class TestRadioConfigCompatibility:
 
         modem._send_command = mock_send_command
         modem.is_connected = True
+        modem.serial_conn = MagicMock(is_open=True)
 
         modem.configure_radio()
 
@@ -999,3 +1602,413 @@ class TestContextManager:
                 mock_connect.assert_called_once()
                 mock_disconnect.assert_called_once()
                 _ = modem  # hold ref so __del__ runs after assert, not before
+
+
+class TestAsyncSendTxDone:
+    """Test async send() TX_DONE confirmation behavior."""
+
+    @pytest.mark.asyncio
+    async def test_send_returns_metadata_after_tx_done(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem.lbt_enabled = False
+        modem.send_frame_and_wait = MagicMock(return_value=True)
+        modem.get_airtime = MagicMock(return_value=123)
+
+        result = await modem.send(b"\x01\x02\x03\x04")
+
+        assert result["airtime_ms"] == 123
+        assert result["lbt_attempts"] == 0
+        modem.send_frame_and_wait.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_send_raises_when_tx_done_not_received(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem.lbt_enabled = False
+        modem.send_frame_and_wait = MagicMock(return_value=False)
+
+        with pytest.raises(Exception, match="TX_DONE"):
+            await modem.send(b"\x01\x02\x03\x04")
+
+
+class TestShutdownAndConnectResilience:
+    def test_cleanup_sets_abort_flags_and_disconnects(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._response_event.clear()
+        modem._tx_done_event.clear()
+
+        with patch.object(modem, "disconnect") as mock_disconnect:
+            modem.cleanup()
+
+        assert modem._shutting_down is True
+        assert modem._response_event.is_set() is True
+        assert modem._tx_done_event.is_set() is True
+        mock_disconnect.assert_called_once()
+
+    def test_send_command_returns_none_while_shutting_down(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._shutting_down = True
+        assert modem._send_command(CMD_GET_VERSION, timeout=0.1) is None
+
+    def test_wait_for_modem_ready_retries_until_pong(self):
+        modem = KissModemWrapper(
+            port="/dev/serial/by-id/test",
+            auto_configure=False,
+            connect_retries=3,
+            post_open_delay_ms=0,
+            startup_retry_budget_sec=30.0,
+        )
+        serial_conn = MagicMock()
+        serial_conn.is_open = True
+        modem.serial_conn = serial_conn
+
+        responses = [None, None, (RESP_PONG, b"")]
+
+        def _fake_send_command(_cmd, data=b"", timeout=1.0):
+            return responses.pop(0)
+
+        modem._send_command = _fake_send_command
+
+        with patch("threading.Event.wait", return_value=None):
+            assert modem._wait_for_modem_ready() is True
+
+        assert modem.serial_conn.write.called
+        assert modem.serial_conn.flush.called
+
+    def test_configure_radio_with_retries_eventually_succeeds(self):
+        modem = KissModemWrapper(
+            port="/dev/null",
+            auto_configure=False,
+            connect_retries=3,
+            startup_retry_budget_sec=30.0,
+        )
+
+        with (
+            patch.object(modem, "configure_radio", side_effect=[False, False, True]) as mock_cfg,
+            patch("threading.Event.wait", return_value=None),
+        ):
+            assert modem._configure_radio_with_retries() is True
+
+        assert mock_cfg.call_count == 3
+
+
+class TestSerialRecovery:
+    """Test serial degraded-state and reconnect behavior."""
+
+    def test_write_frame_marks_degraded_and_triggers_reconnect(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        class _FailingSerial:
+            is_open = True
+
+            def write(self, _data):
+                raise OSError(5, "Input/output error")
+
+        modem.serial_conn = _FailingSerial()
+        modem._start_reconnect_worker = MagicMock()
+
+        frame = modem._encode_kiss_frame(CMD_DATA, b"\x01\x02")
+        assert modem._write_frame(frame) is False
+        assert modem._degraded is True
+        assert modem.is_connected is False
+        assert modem.serial_conn is None
+        modem._start_reconnect_worker.assert_called_once()
+
+    def test_send_command_fails_fast_while_reconnecting(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem._reconnecting_event.set()
+        modem._write_frame = MagicMock(return_value=True)
+
+        assert modem._send_command(CMD_PING, timeout=0.1) is None
+        modem._write_frame.assert_not_called()
+
+    def test_send_command_allowed_from_reconnect_thread_during_reconnect(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem._reconnecting_event.set()
+        modem.reconnect_thread = threading.current_thread()
+        modem._response_queue.append((RESP_PONG, b""))
+
+        assert modem._send_command(CMD_PING, timeout=0.1) == (RESP_PONG, b"")
+
+    def test_send_command_allowed_from_reconnect_thread_while_degraded(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem._degraded = True
+        modem.reconnect_thread = threading.current_thread()
+        modem._response_queue.append((RESP_PONG, b""))
+
+        assert modem._send_command(CMD_PING, timeout=0.1) == (RESP_PONG, b"")
+
+    def test_reconnect_worker_recovers_after_open_failure(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._reconnecting_event.set()
+        modem._degraded = True
+        modem._degraded_reason = "test failure"
+        modem._reconnect_base_delay_s = 0.0
+        modem._reconnect_max_delay_s = 0.0
+
+        modem._open_serial_and_start_threads = MagicMock(side_effect=[False, True])
+        modem._run_post_connect_handshake = MagicMock(return_value=True)
+        modem._stop_io_threads = MagicMock()
+
+        with patch("pymc_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None):
+            modem._reconnect_worker()
+
+        assert modem._open_serial_and_start_threads.call_count == 2
+        assert modem._run_post_connect_handshake.call_count == 1
+        assert modem._degraded is False
+        assert modem._reconnecting_event.is_set() is False
+
+    def test_start_reconnect_worker_guard_prevents_duplicate_thread(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._reconnecting_event.set()
+        modem._start_reconnect_worker()
+        assert modem.reconnect_thread is None
+
+    def test_connect_clears_reconnecting_gate_after_success(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._reconnecting_event.set()
+        modem._open_serial_and_start_threads = MagicMock(return_value=True)
+        modem._run_post_connect_handshake = MagicMock(return_value=True)
+
+        assert modem.connect() is True
+        assert modem.is_connected is True
+        assert modem._reconnecting_event.is_set() is False
+
+    def test_connect_sets_connected_only_after_handshake_success(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._open_serial_and_start_threads = MagicMock(return_value=True)
+
+        def handshake() -> bool:
+            # is_connected should stay false until handshake fully succeeds.
+            assert modem.is_connected is False
+            return True
+
+        modem._run_post_connect_handshake = MagicMock(side_effect=handshake)
+
+        assert modem.connect() is True
+        assert modem.is_connected is True
+
+    def test_connect_handshake_failure_leaves_disconnected(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._open_serial_and_start_threads = MagicMock(return_value=True)
+        modem._run_post_connect_handshake = MagicMock(return_value=False)
+        modem._close_serial_connection = MagicMock()
+
+        assert modem.connect() is False
+        assert modem.is_connected is False
+        modem._close_serial_connection.assert_called_once()
+
+    def test_connect_retries_transient_configure_failure_then_succeeds(self):
+        modem = KissModemWrapper(
+            port="/dev/null",
+            auto_configure=True,
+            radio_config={"frequency": 869618000},
+        )
+        modem._open_serial_and_start_threads = MagicMock(return_value=True)
+        modem._close_serial_connection = MagicMock()
+        modem._query_modem_info = MagicMock()
+        modem._set_kiss_tx_delay = MagicMock()
+
+        connected_states = []
+
+        def transient_configure_failure() -> bool:
+            connected_states.append(modem.is_connected)
+            return len(connected_states) > 1
+
+        modem.configure_radio = MagicMock(side_effect=transient_configure_failure)
+
+        with patch(
+            "pymc_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None
+        ) as sleep_mock, patch("threading.Event.wait", return_value=None):
+            assert modem.connect() is True
+
+        assert modem.configure_radio.call_count == 2
+        assert connected_states == [False, False]
+        assert modem.is_connected is True
+        assert modem._close_serial_connection.call_count == 0
+        assert len(sleep_mock.call_args_list) == 1  # post-connect settle only
+
+    def test_connect_persistent_configure_failures_still_fail(self):
+        modem = KissModemWrapper(
+            port="/dev/null",
+            auto_configure=True,
+            radio_config={"frequency": 869618000},
+        )
+        modem._open_serial_and_start_threads = MagicMock(return_value=True)
+        modem._close_serial_connection = MagicMock()
+        modem._query_modem_info = MagicMock()
+        modem._set_kiss_tx_delay = MagicMock()
+        modem.configure_radio = MagicMock(return_value=False)
+
+        with patch("pymc_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None), patch(
+            "threading.Event.wait", return_value=None
+        ):
+            assert modem.connect() is False
+
+        assert modem.is_connected is False
+        assert modem.configure_radio.call_count == modem.connect_retries
+        modem._close_serial_connection.assert_called_once()
+
+    def test_connect_sets_connected_only_after_retrying_handshake(self):
+        modem = KissModemWrapper(
+            port="/dev/null",
+            auto_configure=True,
+            radio_config={"frequency": 869618000},
+        )
+        modem._open_serial_and_start_threads = MagicMock(return_value=True)
+        modem._close_serial_connection = MagicMock()
+        modem._query_modem_info = MagicMock()
+        modem._set_kiss_tx_delay = MagicMock()
+
+        observed_states = []
+
+        def configure_with_one_retry() -> bool:
+            observed_states.append(modem.is_connected)
+            return len(observed_states) >= 2
+
+        modem.configure_radio = MagicMock(side_effect=configure_with_one_retry)
+
+        with patch("pymc_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None):
+            assert modem.connect() is True
+
+        assert observed_states == [False, False]
+        assert modem.is_connected is True
+
+    def test_reconnect_sets_connected_only_after_handshake_success(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem._reconnecting_event.set()
+        modem._degraded = True
+        modem._degraded_reason = "test failure"
+        modem._reconnect_base_delay_s = 0.0
+        modem._reconnect_max_delay_s = 0.0
+        modem._open_serial_and_start_threads = MagicMock(return_value=True)
+
+        def reconnect_handshake() -> bool:
+            assert modem.is_connected is False
+            return True
+
+        modem._run_post_connect_handshake = MagicMock(side_effect=reconnect_handshake)
+        modem._stop_io_threads = MagicMock()
+
+        with patch("pymc_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None):
+            modem._reconnect_worker()
+
+        assert modem.is_connected is True
+        assert modem._degraded is False
+        assert modem._reconnecting_event.is_set() is False
+
+
+class TestKissDataTxSingleFlight:
+    """DATA transmits are single-flight and fail fast on TX_BUSY / link loss."""
+
+    def test_send_frame_and_wait_is_single_flight(self):
+        """A second DATA frame must not be written while the first is in flight."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        first_sent = threading.Event()
+        second_sent = threading.Event()
+        order: list[str] = []
+
+        def mock_send_frame(data: bytes) -> bool:
+            if data == b"AA":
+                order.append("A")
+                first_sent.set()
+            elif data == b"BB":
+                order.append("B")
+                second_sent.set()
+            return True
+
+        modem.send_frame = mock_send_frame
+
+        results: dict[str, object] = {}
+        t1 = threading.Thread(
+            target=lambda: results.__setitem__("a", modem.send_frame_and_wait(b"AA", timeout=2.0))
+        )
+        t1.start()
+        assert first_sent.wait(timeout=1.0)
+
+        # B must block on the in-flight lock while A awaits TX_DONE.
+        t2 = threading.Thread(
+            target=lambda: results.__setitem__("b", modem.send_frame_and_wait(b"BB", timeout=2.0))
+        )
+        t2.start()
+        assert not second_sent.wait(timeout=0.2)
+
+        tx_done = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_TX_DONE, 0x01, KISS_FEND])
+        for byte in tx_done:  # complete A -> releases the lock
+            modem._decode_kiss_byte(byte)
+
+        assert second_sent.wait(timeout=1.0)
+        for byte in tx_done:  # complete B
+            modem._decode_kiss_byte(byte)
+
+        t1.join(timeout=1.0)
+        t2.join(timeout=1.0)
+        assert results.get("a") is True
+        assert results.get("b") is True
+        assert order == ["A", "B"]
+
+    def test_tx_busy_wakes_sender_and_is_not_queued(self):
+        """A 0x07 (TX_BUSY) error fails the sender fast and is not mis-routed to the
+        SetHardware response path."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        sent = threading.Event()
+        modem.send_frame = lambda data: (sent.set() or True)
+
+        result: dict[str, object] = {}
+        start = time.monotonic()
+        t = threading.Thread(
+            target=lambda: result.__setitem__("r", modem.send_frame_and_wait(b"AA", timeout=5.0))
+        )
+        t.start()
+        assert sent.wait(timeout=1.0)
+
+        err = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_ERROR, HW_ERR_TX_BUSY, KISS_FEND])
+        for byte in err:
+            modem._decode_kiss_byte(byte)
+
+        t.join(timeout=1.0)
+        assert result.get("r") is False
+        assert time.monotonic() - start < 2.0  # failed fast, not via the 5s timeout
+        assert len(modem._response_queue) == 0  # not consumed by the SetHardware waiter
+
+    def test_serial_failure_wakes_in_flight_sender(self):
+        """A serial failure mid-transmit wakes the waiter instead of stalling."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem._start_reconnect_worker = MagicMock()  # don't spawn a reconnect thread
+
+        sent = threading.Event()
+        modem.send_frame = lambda data: (sent.set() or True)
+
+        result: dict[str, object] = {}
+        start = time.monotonic()
+        t = threading.Thread(
+            target=lambda: result.__setitem__("r", modem.send_frame_and_wait(b"AA", timeout=5.0))
+        )
+        t.start()
+        assert sent.wait(timeout=1.0)
+
+        modem._mark_serial_failure("link lost")
+
+        t.join(timeout=1.0)
+        assert result.get("r") is False
+        assert time.monotonic() - start < 2.0
+
+    def test_send_frame_and_wait_skips_when_degraded(self):
+        """Don't enqueue DATA while the link is degraded."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem._degraded = True
+        modem.send_frame = MagicMock(return_value=True)
+
+        assert modem.send_frame_and_wait(b"AA", timeout=2.0) is False
+        modem.send_frame.assert_not_called()

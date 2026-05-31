@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -495,6 +495,21 @@ class TestDispatcherSendPacket:
 
         assert result is True
 
+    @pytest.mark.asyncio
+    async def test_send_packet_returns_false_when_radio_send_returns_none(self, dispatcher):
+        """If radio.send returns None, dispatcher must fail the send."""
+        packet = Packet()
+        packet.header = (0 << 6) | (0 << 4) | (PAYLOAD_TYPE_ADVERT << 2) | 0
+        packet.payload = bytearray(b"test_packet_data")
+        packet.payload_len = len(packet.payload)
+        packet.path_len = 0
+
+        dispatcher.radio.send = AsyncMock(return_value=None)
+
+        result = await dispatcher.send_packet(packet, wait_for_ack=False)
+
+        assert result is False
+
     def test_own_packet_detection(self, dispatcher):
         """Test detection of own packets."""
         # Create packet with our own address as source
@@ -651,6 +666,29 @@ class TestDispatcherMaintenance:
 
         # Verify cleanup was called
         dispatcher.packet_filter.cleanup_old_hashes.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_run_forever_health_check_uses_to_thread(self, dispatcher):
+        """Health checks should run via asyncio.to_thread to avoid loop blocking."""
+        dispatcher.radio.check_radio_health = Mock(return_value=True)
+
+        sleep_calls = {"count": 0}
+
+        async def fake_sleep(_seconds):
+            sleep_calls["count"] += 1
+            if sleep_calls["count"] >= 60:
+                raise asyncio.CancelledError()
+
+        to_thread_mock = AsyncMock(return_value=True)
+
+        with (
+            patch("pymc_core.node.dispatcher.asyncio.sleep", side_effect=fake_sleep),
+            patch("pymc_core.node.dispatcher.asyncio.to_thread", to_thread_mock),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await dispatcher.run_forever()
+
+        to_thread_mock.assert_awaited_once_with(dispatcher.radio.check_radio_health)
 
 
 class TestDispatcherErrorHandling:

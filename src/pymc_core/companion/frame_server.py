@@ -1139,13 +1139,8 @@ class CompanionFrameServer:
         if self.bridge.get_channel(channel_idx) is None:
             self._write_err(ERR_CODE_NOT_FOUND)
             return
-        self._write_ok()
         ok = await self.bridge.send_channel_message(channel_idx, text)
-        if not ok:
-            logger.warning(
-                "Channel message send failed for channel %d after OK response was already sent",
-                channel_idx,
-            )
+        self._write_ok() if ok else self._write_err(ERR_CODE_BAD_STATE)
 
     async def _cmd_send_channel_data(self, data: bytes) -> None:
         """Handle CMD_SEND_CHANNEL_DATA (62)."""
