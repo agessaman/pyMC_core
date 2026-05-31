@@ -29,6 +29,7 @@ from pymc_core.hardware.kiss_modem_wrapper import (
     HW_CMD_GET_VERSION,
     HW_CMD_REBOOT,
     HW_CMD_SET_SIGNAL_REPORT,
+    HW_ERR_TX_BUSY,
     HW_RESP_DEVICE_NAME,
     HW_RESP_MCU_TEMP,
     HW_RESP_OK,
@@ -1900,3 +1901,114 @@ class TestSerialRecovery:
         assert modem.is_connected is True
         assert modem._degraded is False
         assert modem._reconnecting_event.is_set() is False
+
+
+class TestKissDataTxSingleFlight:
+    """DATA transmits are single-flight and fail fast on TX_BUSY / link loss."""
+
+    def test_send_frame_and_wait_is_single_flight(self):
+        """A second DATA frame must not be written while the first is in flight."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        first_sent = threading.Event()
+        second_sent = threading.Event()
+        order: list[str] = []
+
+        def mock_send_frame(data: bytes) -> bool:
+            if data == b"AA":
+                order.append("A")
+                first_sent.set()
+            elif data == b"BB":
+                order.append("B")
+                second_sent.set()
+            return True
+
+        modem.send_frame = mock_send_frame
+
+        results: dict[str, object] = {}
+        t1 = threading.Thread(
+            target=lambda: results.__setitem__("a", modem.send_frame_and_wait(b"AA", timeout=2.0))
+        )
+        t1.start()
+        assert first_sent.wait(timeout=1.0)
+
+        # B must block on the in-flight lock while A awaits TX_DONE.
+        t2 = threading.Thread(
+            target=lambda: results.__setitem__("b", modem.send_frame_and_wait(b"BB", timeout=2.0))
+        )
+        t2.start()
+        assert not second_sent.wait(timeout=0.2)
+
+        tx_done = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_TX_DONE, 0x01, KISS_FEND])
+        for byte in tx_done:  # complete A -> releases the lock
+            modem._decode_kiss_byte(byte)
+
+        assert second_sent.wait(timeout=1.0)
+        for byte in tx_done:  # complete B
+            modem._decode_kiss_byte(byte)
+
+        t1.join(timeout=1.0)
+        t2.join(timeout=1.0)
+        assert results.get("a") is True
+        assert results.get("b") is True
+        assert order == ["A", "B"]
+
+    def test_tx_busy_wakes_sender_and_is_not_queued(self):
+        """A 0x07 (TX_BUSY) error fails the sender fast and is not mis-routed to the
+        SetHardware response path."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+
+        sent = threading.Event()
+        modem.send_frame = lambda data: (sent.set() or True)
+
+        result: dict[str, object] = {}
+        start = time.monotonic()
+        t = threading.Thread(
+            target=lambda: result.__setitem__("r", modem.send_frame_and_wait(b"AA", timeout=5.0))
+        )
+        t.start()
+        assert sent.wait(timeout=1.0)
+
+        err = bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_ERROR, HW_ERR_TX_BUSY, KISS_FEND])
+        for byte in err:
+            modem._decode_kiss_byte(byte)
+
+        t.join(timeout=1.0)
+        assert result.get("r") is False
+        assert time.monotonic() - start < 2.0  # failed fast, not via the 5s timeout
+        assert len(modem._response_queue) == 0  # not consumed by the SetHardware waiter
+
+    def test_serial_failure_wakes_in_flight_sender(self):
+        """A serial failure mid-transmit wakes the waiter instead of stalling."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem._start_reconnect_worker = MagicMock()  # don't spawn a reconnect thread
+
+        sent = threading.Event()
+        modem.send_frame = lambda data: (sent.set() or True)
+
+        result: dict[str, object] = {}
+        start = time.monotonic()
+        t = threading.Thread(
+            target=lambda: result.__setitem__("r", modem.send_frame_and_wait(b"AA", timeout=5.0))
+        )
+        t.start()
+        assert sent.wait(timeout=1.0)
+
+        modem._mark_serial_failure("link lost")
+
+        t.join(timeout=1.0)
+        assert result.get("r") is False
+        assert time.monotonic() - start < 2.0
+
+    def test_send_frame_and_wait_skips_when_degraded(self):
+        """Don't enqueue DATA while the link is degraded."""
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        modem.is_connected = True
+        modem._degraded = True
+        modem.send_frame = MagicMock(return_value=True)
+
+        assert modem.send_frame_and_wait(b"AA", timeout=2.0) is False
+        modem.send_frame.assert_not_called()

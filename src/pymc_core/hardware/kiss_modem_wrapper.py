@@ -175,6 +175,8 @@ HW_ERR_NO_CALLBACK = 0x03
 HW_ERR_MAC_FAILED = 0x04
 HW_ERR_UNKNOWN_CMD = 0x05
 HW_ERR_ENCRYPT_FAILED = 0x06
+# Emitted only on the DATA path when a transmit is already pending (single-slot modem TX).
+HW_ERR_TX_BUSY = 0x07
 
 ERR_INVALID_LENGTH = HW_ERR_INVALID_LENGTH
 ERR_INVALID_PARAM = HW_ERR_INVALID_PARAM
@@ -182,6 +184,7 @@ ERR_NO_CALLBACK = HW_ERR_NO_CALLBACK
 ERR_MAC_FAILED = HW_ERR_MAC_FAILED
 ERR_UNKNOWN_CMD = HW_ERR_UNKNOWN_CMD
 ERR_ENCRYPT_FAILED = HW_ERR_ENCRYPT_FAILED
+ERR_TX_BUSY = HW_ERR_TX_BUSY
 
 # Buffer and timing constants
 MAX_FRAME_SIZE = 512
@@ -193,6 +196,9 @@ TX_BUFFER_SIZE = 1024
 DEFAULT_BAUDRATE = 115200
 DEFAULT_TIMEOUT = 1.0
 RESPONSE_TIMEOUT = 5.0  # Timeout for command responses
+# Extra margin added to estimated airtime when waiting for a DATA TX_DONE, so a long
+# transmit (e.g. a high-SF flood advert) is not cut short by the flat command timeout.
+TX_DONE_TIMEOUT_MARGIN_S = 1.0
 POST_CONNECT_SETTLE_SECONDS = 0.75
 POST_CONNECT_CONFIGURE_RETRIES = 2
 POST_CONNECT_CONFIGURE_RETRY_BACKOFF_SECONDS = 0.25
@@ -377,6 +383,10 @@ class KissModemWrapper(LoRaRadio):
         self._response_queue: deque[tuple[int, bytes]] = deque(maxlen=32)
 
         # TX completion tracking
+        # Single-flight DATA transmit: the modem holds one pending TX, so only one
+        # frame may be in flight at a time. Serializing here prevents a second frame
+        # being written mid-transmit and rejected with TX_BUSY (0x07).
+        self._tx_inflight_lock = threading.Lock()
         self._tx_done_event = threading.Event()
         self._tx_done_result: Optional[bool] = None
 
@@ -688,6 +698,10 @@ class KissModemWrapper(LoRaRadio):
             self.is_connected = False
             self._close_serial_connection()
 
+        # Wake any in-flight DATA sender so it fails fast instead of waiting out the
+        # full TX_DONE timeout on a link that is already gone (cleanup() does the same).
+        self._tx_done_event.set()
+
         self._start_reconnect_worker()
 
     def _start_reconnect_worker(self) -> None:
@@ -972,25 +986,61 @@ class KissModemWrapper(LoRaRadio):
 
     def send_frame_and_wait(self, data: bytes, timeout: float = RESPONSE_TIMEOUT) -> bool:
         """
-        Send a data frame and wait for TX_DONE response
+        Send a data frame and wait for the modem's TX_DONE.
+
+        DATA transmits are single-flight: the modem holds only one pending TX, so
+        only one frame may be in flight at a time. Concurrent callers serialize on
+        ``_tx_inflight_lock`` so a second frame is never written mid-transmit and
+        rejected with TX_BUSY (0x07).
 
         Args:
             data: Raw packet data to send
-            timeout: Timeout in seconds to wait for TX_DONE
+            timeout: Base timeout in seconds to wait for TX_DONE; extended to cover
+                the estimated airtime of long frames.
 
         Returns:
-            True if transmission successful, False otherwise
+            True if transmission completed (TX_DONE ok), False otherwise.
         """
-        self._tx_done_event.clear()
-        self._tx_done_result = None
-
-        if not self.send_frame(data):
+        if self._shutting_down:
             return False
 
-        # Wait for TX_DONE response
-        if self._tx_done_event.wait(timeout):
-            return self._tx_done_result or False
-        else:
+        # Don't enqueue DATA while the link is down/reconnecting (mirror _send_command).
+        in_reconnect_thread = threading.current_thread() is self.reconnect_thread
+        if (self._reconnecting_event.is_set() or self._degraded) and not in_reconnect_thread:
+            return False
+
+        # Extend the wait to cover real airtime; a high-SF flood advert can exceed the
+        # flat command timeout, which would otherwise look like a spurious TX_DONE timeout.
+        try:
+            airtime_s = PacketTimingUtils.estimate_airtime_ms(len(data), self.radio_config) / 1000.0
+        except Exception:
+            airtime_s = 0.0
+        effective_timeout = max(timeout, airtime_s + TX_DONE_TIMEOUT_MARGIN_S)
+
+        with self._tx_inflight_lock:
+            self._tx_done_event.clear()
+            self._tx_done_result = None
+
+            if not self.send_frame(data):
+                return False
+
+            # Poll in short slices so a shutdown or mid-flight link failure returns
+            # promptly instead of stalling the full timeout. TX_DONE (success/fail)
+            # and TX_BUSY both set the event; a link drop sets it via
+            # _mark_serial_failure / cleanup.
+            deadline = time.monotonic() + effective_timeout
+            while not self._shutting_down:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if self._tx_done_event.wait(min(0.1, remaining)):
+                    return self._tx_done_result or False
+                if self._degraded or self.stop_event.is_set():
+                    return False
+
+            if self._shutting_down:
+                return False
+
             logger.warning("TX_DONE timeout")
             return False
 
@@ -1849,21 +1899,32 @@ class KissModemWrapper(LoRaRadio):
                 self._tx_done_event.set()
 
             elif sub_cmd == HW_RESP_ERROR:
-                if len(payload) >= 1:
+                err_code = payload[0] if len(payload) >= 1 else None
+                if err_code is not None:
                     self.stats["errors"] += 1
-                    logger.warning(f"Modem error: 0x{payload[0]:02X}")
-                with self._response_lock:
-                    expected = self._expected_response_subcmds
-                    if expected is not None and sub_cmd in expected:
-                        self._pending_response = (sub_cmd, payload)
-                        self._response_event.set()
-                    else:
-                        if len(self._response_queue) == self._response_queue.maxlen:
-                            logger.debug(
-                                "Dropping oldest SetHardware response (queue full); sub_cmd=0x%02X",
-                                sub_cmd,
-                            )
-                        self._response_queue.append((sub_cmd, payload))
+                    logger.warning(f"Modem error: 0x{err_code:02X}")
+                if err_code == HW_ERR_TX_BUSY:
+                    # TX_BUSY is a DATA-transmit rejection, not a SetHardware response.
+                    # Wake the in-flight DATA sender so it fails fast (and can retry)
+                    # rather than stalling until the TX_DONE timeout, and keep it out
+                    # of the SetHardware response path (where it would be mis-consumed
+                    # as the in-flight command's error reply).
+                    self._tx_done_result = False
+                    self._tx_done_event.set()
+                else:
+                    with self._response_lock:
+                        expected = self._expected_response_subcmds
+                        if expected is not None and sub_cmd in expected:
+                            self._pending_response = (sub_cmd, payload)
+                            self._response_event.set()
+                        else:
+                            if len(self._response_queue) == self._response_queue.maxlen:
+                                logger.debug(
+                                    "Dropping oldest SetHardware response (queue full); "
+                                    "sub_cmd=0x%02X",
+                                    sub_cmd,
+                                )
+                            self._response_queue.append((sub_cmd, payload))
 
             else:
                 # Other response sub-commands (Identity, Radio, OK, etc.)
