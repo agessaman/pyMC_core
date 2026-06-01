@@ -160,7 +160,22 @@ class LoginServerHandler(BaseHandler):
                     f"{password_bytes.hex() if password_bytes else '(empty)'}"
                 )
             else:
-                # Repeater format: password only
+                # Repeater format: password only.
+                # Defensive: an ANON_REQ sub-type byte in 0x01..0x1F is a discovery/
+                # control request (regions/owner/basic), NOT a password. Firmware
+                # ``onAnonDataRecv`` only treats ``data[4] == 0 || data[4] >= ' '`` as a
+                # login; mirror that so a discovery request routed straight to this
+                # handler (e.g. addressed to a companion identity) isn't mis-parsed as a
+                # failed password login. When wrapped by AnonRequestHandler this branch
+                # never sees those sub-types, so this is purely a safety net.
+                subtype = plaintext[4] if len(plaintext) > 4 else 0
+                if 0x00 < subtype < 0x20:
+                    self.log(
+                        f"[LoginServer] ANON_REQ sub-type 0x{subtype:02X} is a discovery "
+                        f"request, not a login, ignoring"
+                    )
+                    return
+
                 # Find null terminator after timestamp (starting from byte 4)
                 null_idx = plaintext.find(b"\x00", 4)
                 if null_idx == -1:
@@ -291,9 +306,7 @@ class LoginServerHandler(BaseHandler):
                     route_type="flood",
                 )
                 packet_type_name = "RESPONSE(flood)"
-                self.log(
-                    f"[LoginServer] Creating RESPONSE datagram (direct login, flood reply)"
-                )
+                self.log("[LoginServer] Creating RESPONSE datagram (direct login, flood reply)")
 
             # Debug: Log packet details
             self.log(

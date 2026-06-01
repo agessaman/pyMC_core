@@ -211,3 +211,57 @@ class TestAnonRequestHandler:
         pkt.payload[0] = (self.server_identity.get_public_key()[0] + 1) & 0xFF
         await self.handler(pkt)
         assert self.sent == []
+
+
+class TestLoginServerDiscoverySubtypeGuard:
+    """A bare LoginServerHandler (e.g. the companion-bridge ANON_REQ slot) must not
+    treat a discovery sub-type (0x01..0x1F) as a password. Mirrors firmware
+    onAnonDataRecv, which only routes ``data[4] == 0 || data[4] >= ' '`` to login."""
+
+    def setup_method(self):
+        self.server_identity = LocalIdentity()
+        self.client_identity_local = LocalIdentity()
+        self.auth_calls = []
+
+        def _auth(*a, **k):
+            self.auth_calls.append((a, k))
+            return (True, 0x03)
+
+        self.handler = LoginServerHandler(
+            local_identity=self.server_identity,
+            log_fn=lambda *_: None,
+            authenticate_callback=_auth,
+            is_room_server=False,
+        )
+        self.sent = []
+        self.handler.set_send_packet_callback(lambda pkt, delay: self.sent.append((pkt, delay)))
+
+    def _build(self, plaintext: bytes):
+        server_id = Identity(self.server_identity.get_public_key())
+        shared_secret = server_id.calc_shared_secret(self.client_identity_local.get_private_key())
+        encrypted = CryptoUtils.encrypt_then_mac(shared_secret[:16], shared_secret, plaintext)
+        server_pubkey = self.server_identity.get_public_key()
+        payload = (
+            bytes([server_pubkey[0]]) + self.client_identity_local.get_public_key() + encrypted
+        )
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_ANON_REQ << 2) | ROUTE_TYPE_DIRECT
+        pkt.payload = bytearray(payload)
+        pkt.payload_len = len(payload)
+        pkt.path = bytearray()
+        pkt.path_len = 0
+        return pkt
+
+    @pytest.mark.asyncio
+    async def test_discovery_subtype_not_treated_as_login(self):
+        # timestamp(4) + REGIONS sub-type + reply-path byte
+        plaintext = struct.pack("<I", 4321) + bytes([ANON_REQ_TYPE_REGIONS, 0x00])
+        await self.handler(self._build(plaintext))
+        assert self.auth_calls == []  # never attempted to authenticate
+        assert self.sent == []  # and no reply sent
+
+    @pytest.mark.asyncio
+    async def test_real_password_still_authenticates(self):
+        plaintext = struct.pack("<I", 4321) + b"admin123\x00"
+        await self.handler(self._build(plaintext))
+        assert len(self.auth_calls) == 1  # password path still works
